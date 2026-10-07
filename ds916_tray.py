@@ -1457,17 +1457,40 @@ def get_hwinfo_start_time():
         cb_needed = wintypes.DWORD()
         psapi.EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(cb_needed))
         count = cb_needed.value // ctypes.sizeof(wintypes.DWORD)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ = 0x0010
+        log.debug(f'get_hwinfo_start_time: enumerated {count} processes')
+        found_hwinfo = False
         for i in range(count):
             pid = pids[i]
             if not pid: continue
-            hproc = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
-            if not hproc: continue
+            hproc = None
+            for access in (PROCESS_QUERY_LIMITED_INFORMATION,
+                           PROCESS_QUERY_INFORMATION,
+                           PROCESS_QUERY_INFORMATION | PROCESS_VM_READ):
+                hproc = kernel32.OpenProcess(access, False, pid)
+                if hproc: break
+            if not hproc:
+                continue
             try:
                 name_buf = ctypes.create_unicode_buffer(260)
                 size = wintypes.DWORD(260)
+                got_name = False
                 if psapi.GetModuleBaseNameW(hproc, None, name_buf, size):
-                    if name_buf.value.lower() == 'hwinfo64.exe':
+                    got_name = True
+                else:
+                    path_buf = ctypes.create_unicode_buffer(1024)
+                    path_size = wintypes.DWORD(1024)
+                    if kernel32.QueryFullProcessImageNameW(hproc, 0, path_buf, ctypes.byref(path_size)):
+                        import os as _os
+                        name_buf.value = _os.path.basename(path_buf.value)
+                        got_name = True
+                if got_name:
+                    name_lower = name_buf.value.lower()
+                    log.debug(f'  PID {pid}: {name_buf.value} (lower={name_lower})')
+                    if name_lower == 'hwinfo64.exe':
+                        found_hwinfo = True
                         creation = wintypes.FILETIME()
                         exit_t = wintypes.FILETIME()
                         kernel_t = wintypes.FILETIME()
@@ -1475,9 +1498,14 @@ def get_hwinfo_start_time():
                         if kernel32.GetProcessTimes(hproc, ctypes.byref(creation),
                                 ctypes.byref(exit_t), ctypes.byref(kernel_t), ctypes.byref(user_t)):
                             ft = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                            log.info(f'Found HWiNFO64.exe at PID {pid}, start time resolved')
                             return datetime(1601,1,1) + timedelta(microseconds=ft/10)
+                        else:
+                            log.warning(f'  PID {pid}: GetProcessTimes failed (err={kernel32.GetLastError()})')
             finally:
                 kernel32.CloseHandle(hproc)
+        if not found_hwinfo:
+            log.debug('get_hwinfo_start_time: HWiNFO64.exe not found in process list')
     except Exception as e:
         log.warning(f'Could not detect HWiNFO64 start time: {e}')
     return None
