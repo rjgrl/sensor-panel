@@ -69,6 +69,7 @@ DEFAULT_CFG = {
     'rtss_process': '',              # empty = auto-detect active 3D app; or an exact exe name (e.g. "game.exe") to pin a specific process
     'log_level': 'normal',           # 'off', 'normal', or 'verbose' -- see Logging section above
     'hwinfo_auto_restart': False,    # opt-in: if True, periodically check HWiNFO64's uptime and restart it before the 12h shared-memory limit -- see check_hwinfo_restart_needed(). Off by default so we never restart HWiNFO64 without explicit permission, and so Pro license holders (no 12h limit) aren't restarted needlessly.
+    'hwinfo_pro': False,               # if True, use '-sensors' flag when restarting HWiNFO64 (Pro feature). Free version rejects command-line params.
     # Note: there is no persisted sensor index map here. Standard sensor
     # keys (CPU_USAGE, GPU_TEMP, etc.) are resolved fresh by NAME on every
     # single read inside read_sharedmem() -- nothing is ever cached across
@@ -1563,7 +1564,10 @@ def check_hwinfo_restart_needed():
         subprocess.run(['taskkill', '/IM', 'HWiNFO64.exe', '/F'],
                        capture_output=True, timeout=10)
         time.sleep(2)
-        subprocess.Popen([path, '-sensors'])
+        args = [path]
+        if cfg.get('hwinfo_pro', False):
+            args.append('-sensors')
+        subprocess.Popen(args)
         log.info('HWiNFO64 restarted successfully')
     except Exception as e:
         log.error(f'HWiNFO64 restart failed: {e}')
@@ -1722,6 +1726,13 @@ def open_settings():
                        "asking each time — only enable it if you're comfortable with that.",
               font=('Segoe UI', 8), foreground='#888', justify='left').pack(anchor='w', padx=10, pady=(0,4))
 
+    hwinfo_pro_var = tk.BooleanVar(value=cfg.get('hwinfo_pro', False))
+    ttk.Checkbutton(t3, text='I have HWiNFO64 Pro (enable -sensors flag on auto-restart)',
+                    variable=hwinfo_pro_var).pack(anchor='w', padx=10, pady=(6,4))
+    ttk.Label(t3, text="Only check this if you own a Pro license. The free version will show\n"
+                       "an error dialog if launched with command-line parameters.",
+              font=('Segoe UI', 8), foreground='#888', justify='left').pack(anchor='w', padx=10, pady=(0,4))
+
     hwinfo_status_lbl = ttk.Label(t3, text='', font=('Segoe UI', 9))
     hwinfo_status_lbl.pack(anchor='w', padx=10, pady=(2,8))
     def refresh_hwinfo_status():
@@ -1795,6 +1806,7 @@ def open_settings():
         cfg['rtss_process']  = proc_var.get().strip() if rtss_mode_var.get()=='manual' else ''
         cfg['hwinfo_path']   = hwinfo_path_var.get().strip()
         cfg['hwinfo_auto_restart'] = auto_restart_var.get()
+        cfg['hwinfo_pro']    = hwinfo_pro_var.get()
         cfg['log_level']     = log_level_var.get()
 
         # Log what actually changed, not just that Save was clicked -- useful
@@ -1802,7 +1814,7 @@ def open_settings():
         # stop" traces back to someone switching log_level to 'off' on a
         # specific date).
         for key in ('com_port','fps','autostart','rtss_process','hwinfo_path',
-                    'hwinfo_auto_restart','log_level'):
+                    'hwinfo_auto_restart','hwinfo_pro','log_level'):
             if old_cfg.get(key) != cfg.get(key):
                 log.info(f'Setting changed: {key} = {old_cfg.get(key)!r} -> {cfg.get(key)!r}')
 
