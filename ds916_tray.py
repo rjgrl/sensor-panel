@@ -1545,7 +1545,7 @@ def check_hwinfo_restart_needed():
         log.debug('HWiNFO restart check: HWiNFO64 not currently running, nothing to do')
         return
 
-    uptime_seconds = (datetime.now() - start).total_seconds()
+    uptime_seconds = (datetime.utcnow() - start).total_seconds()
     log.debug(f'HWiNFO restart check: HWiNFO64 uptime is {uptime_seconds/3600:.2f}h')
     if uptime_seconds < HWINFO_RESTART_THRESHOLD:
         return
