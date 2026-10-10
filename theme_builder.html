@@ -157,7 +157,6 @@ select option{background:#1f1f25}
   <button class="btn" onclick="loadBack()">🖼 Background</button>
   <button class="btn" onclick="loadImgLayer()">+ Image</button>
   <div class="sep"></div>
-  <button class="btn" onclick="openSensorMap()">⚙ Sensor Map</button>
   <button class="btn" onclick="importSensorList()">🔍 Sensors</button>
   <button class="btn primary" onclick="openAiGenerate()" style="background:linear-gradient(90deg,#a070d0,#00b4ff);border:none;color:#fff">✨ AI Generate</button>
   <div class="sep"></div>
@@ -258,13 +257,13 @@ const SEN={
   // Network
   NET_DOWN:    {l:'Download Speed',     u:'MB/s', s:45,  max:null, cat:'network'},
   NET_UP:      {l:'Upload Speed',       u:'MB/s', s:12,  max:null, cat:'network'},
-  NET_PING:    {l:'Ping',               u:'ms',   s:8,   max:null, cat:'network'},
+  NET_PING:    {l:'Ping (not available via LHM)', u:'ms', s:8, max:null, cat:'network'},
   // Framerate — opt-in only (require separate software)
   RTSS_FPS:    {l:'Framerate — Live (RTSS)',     u:'FPS',  s:120, max:null, cat:'framerate'},
   RTSS_FPS_MIN:{l:'Framerate Min — Session (RTSS)',u:'FPS', s:95,  max:null, cat:'framerate'},
   RTSS_FPS_MAX:{l:'Framerate Max — Session (RTSS)',u:'FPS', s:144, max:null, cat:'framerate'},
   RTSS_FPS_AVG:{l:'Framerate Avg — Session (RTSS)',u:'FPS', s:118, max:null, cat:'framerate'},
-  FRAMERATE:   {l:'Framerate (PresentMon — unreliable w/o Pro)', u:'FPS', s:120, max:null, cat:'framerate'},
+  FRAMERATE:   {l:'Framerate (legacy — use RTSS instead)', u:'FPS', s:120, max:null, cat:'framerate'},
   // System
   BATTERY:     {l:'Battery',            u:'%',    s:85,  max:100,  cat:'system'},
 };
@@ -289,7 +288,8 @@ let visibleSensors=new Set([
   'MB_TEMP','CHASSIS_FAN1','CHASSIS_FAN2','CHASSIS_FAN3',
   // Framerate: live rolling average via RTSS (requires separate RTSS install).
   // Session-based min/max/avg variants are opt-in via + Sensors.
-  // FRAMERATE (PresentMon) is also opt-in — unreliable without HWiNFO Pro.
+  // FRAMERATE is a legacy key kept only so old themes still load — LibreHardwareMonitor
+  // has no framerate sensor, so use the RTSS keys for FPS.
   'RTSS_FPS',
 ]);
 
@@ -299,13 +299,11 @@ const FULL_PALETTE_KEYS=new Set([
   'CPU_USAGE','CPU_TEMP','GPU_USAGE','GPU_TEMP','RAM_USAGE','VRAM_USAGE'
 ]);
 
-// HWiNFO registry index map
-let sensorMap={
-  CPU_USAGE:0,CPU_TEMP:1,MB_TEMP:2,CPU_FAN:3,
-  CHASSIS_FAN1:4,CHASSIS_FAN2:5,GPU_TEMP:6,
-  GPU_FAN1:7,GPU_FAN2:8,GPU_USAGE:9,
-  RAM_USAGE:null,RAM_USED_GB:null,NET_DOWN:null,NET_UP:null
-};
+// Sensor map: only CUSTOM_* keys need an entry here. Each maps to the
+// LibreHardwareMonitor SensorId it reads (e.g. "/amdcpu/0/temperature/2"),
+// which stays stable across restarts. Standard keys (CPU_USAGE, GPU_TEMP, …)
+// are resolved by name inside the tray app and need no mapping at all.
+let sensorMap={};
 
 // ── UTILS ─────────────────────────────────────────────────────────────────────
 function $(id){return document.getElementById(id);}
@@ -1240,31 +1238,6 @@ function clearAll(){
   toast('Cleared');
 }
 
-// ── SENSOR MAP ────────────────────────────────────────────────────────────────
-function openSensorMap(){
-  const rows=Object.entries(sensorMap).map(([k,idx])=>`<tr>
-    <td style="color:var(--text);padding:3px 8px">${SEN[k]?.l||k}</td>
-    <td style="padding:3px 8px"><code style="font-size:10px;color:var(--muted)">${k}</code></td>
-    <td style="padding:3px 8px"><input type="number" min="0" max="99" value="${idx??''}" placeholder="—" data-key="${k}" style="width:56px;background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:2px 5px;border-radius:3px;font-size:11px;text-align:center"></td>
-  </tr>`).join('');
-  const m=document.createElement('div');m.className='mbg';
-  m.innerHTML=`<div class="modal" style="max-width:460px"><h2>⚙ HWiNFO64 Sensor Map</h2>
-    <p style="font-size:11px;color:var(--muted);margin-bottom:10px">Enter the registry index (ValueRawN) from HWiNFO64 Gadget output.</p>
-    <table style="width:100%;border-collapse:collapse"><thead><tr>
-      <th style="text-align:left;padding:3px 8px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border)">Sensor</th>
-      <th style="text-align:left;padding:3px 8px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border)">Key</th>
-      <th style="text-align:left;padding:3px 8px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border)">Index</th>
-    </tr></thead><tbody>${rows}</tbody></table>
-    <div class="mbtns"><button class="btn" onclick="this.closest('.mbg').remove()">Cancel</button>
-    <button class="btn primary" onclick="saveSensorMap(this.closest('.mbg'))">Save</button></div></div>`;
-  document.body.appendChild(m);
-}
-function saveSensorMap(mbg){
-  mbg.querySelectorAll('input[data-key]').forEach(inp=>{
-    const v=inp.value.trim();sensorMap[inp.dataset.key]=v===''?null:parseInt(v);
-  });mbg.remove();toast('Sensor map saved');
-}
-
 function loadThemeJson(theme){
   clearAllSilent();
   if(theme.sensorMap)Object.assign(sensorMap,theme.sensorMap);
@@ -1330,106 +1303,95 @@ function loadFontFile(){
 }
 
 // ── SENSOR FILE IMPORT ────────────────────────────────────────────────────────
-// hwinfo_sensors.json → %APPDATA%\DS916Tray\hwinfo_sensors.json
+// lhm_sensors.json → %APPDATA%\DS916Tray\lhm_sensors.json (written by the tray app from LibreHardwareMonitor)
 // Themes              → %APPDATA%\DS916Tray\Themes\
 
 const APPDATA_PATH = '%APPDATA%\\DS916Tray';
-const SENSORS_PATH = APPDATA_PATH + '\\hwinfo_sensors.json';
+const SENSORS_PATH = APPDATA_PATH + '\\lhm_sensors.json';
 const THEMES_PATH  = APPDATA_PATH + '\\Themes';
 
 let discoveredSensors = [];
 
 function getDefaultMax(s){
   if(s.type==='Temperature') return 110;
-  if(s.type==='Usage') return 100;
+  if(s.type==='Load'||s.type==='Usage'||s.type==='Level'||s.type==='Control') return 100;
   if(s.type==='Fan') return 4000;
   if(s.type==='Power') return 500;
+  if(s.type==='Clock') return 6000;
   return null;
 }
 function getCat(type){
   const m={
-    Temperature:'motherboard', // default; specific sensors get mapped better via stdNames
+    Temperature:'motherboard',
     Fan:'motherboard',
-    Usage:'cpu',
-    Voltage:'system',
-    Current:'system',
-    Power:'system',
+    Load:'cpu', Usage:'cpu',
+    Voltage:'system', Current:'system', Power:'system',
     Clock:'cpu',
+    Data:'ram', SmallData:'ram',
+    Throughput:'storage',
   };
   return m[type]||'system';
+}
+// LHM reuses short names a lot ("GPU Core" is a load, a temperature, a clock
+// and a power sensor; every drive has a "Temperature"), so make labels unique:
+// add the sensor type when a name repeats within one device, and the device
+// name when it repeats across devices.
+const TYPE_WORD={Load:'Load',Temperature:'Temp',Clock:'Clock',Power:'Power',Voltage:'Voltage',
+  Current:'Current',Fan:'Fan',Control:'Fan Control',Data:'',SmallData:'',Throughput:'',Level:'Level',Factor:''};
+function lhmLabels(sensors){
+  const byName={};
+  for(const s of sensors)(byName[s.name]=byName[s.name]||[]).push(s);
+  const out={};
+  for(const [name,list] of Object.entries(byName)){
+    for(const s of list){
+      let l=name;
+      const sameDevSameName=list.filter(o=>o.sensor_index===s.sensor_index);
+      if(sameDevSameName.length>1){const w=TYPE_WORD[s.type]??s.type; if(w&&!l.toLowerCase().includes(w.toLowerCase())) l+=' '+w;}
+      const otherDevs=new Set(list.map(o=>o.sensor_index));
+      if(otherDevs.size>1&&s.device) l=s.device+': '+l;
+      out[s.id||s.index]=l;
+    }
+  }
+  return out;
+}
+function sensorKeyFor(s){
+  // Stable key derived from the LHM SensorId, e.g. CUSTOM__amdcpu_0_temperature_2
+  return 'CUSTOM_'+String(s.id).replace(/[^A-Za-z0-9]/g,'_');
 }
 
 function applySensorData(data, filename){
   if(!data.sensors||!Array.isArray(data.sensors)) throw new Error('Invalid sensor file');
+  if(data.source!=='LibreHardwareMonitor'||!data.sensors.every(s=>typeof s.id==='string'))
+    throw new Error('This looks like an old HWiNFO sensor file — use lhm_sensors.json instead');
   discoveredSensors=data.sensors;
 
-  // Build a lookup from sensor_index -> device name for enriching discovered sensors
-  const deviceNameMap={};
+  // Hardware names as static-label entries in a dedicated 'devicenames' category
+  // so users can drop them onto the canvas as identifying labels
   if(data.device_names&&Array.isArray(data.device_names)){
     for(const d of data.device_names){
-      deviceNameMap[d.index]=d.name;
-    }
-    // Add device names as static-label entries in a dedicated 'devicenames' category
-    // so users can drop them onto the canvas as identifying labels
-    for(const d of data.device_names){
       const key=`DEVICE_${d.index}`;
-      if(!SEN[key]){
-        SEN[key]={l:d.name,u:'',s:d.name,max:null,cat:'devicenames'};
-      }
+      SEN[key]={l:d.name,u:'',s:d.name,max:null,cat:'devicenames'};
     }
-    // Ensure the devicenames category exists in CATS (add dynamically if not already there)
     if(data.device_names.length>0&&!CATS.find(c=>c.id==='devicenames')){
-      // Insert before _static
       const staticIdx=CATS.findIndex(c=>c.id==='_static');
       CATS.splice(staticIdx,0,{id:'devicenames',label:'🖥 Device Names'});
     }
   }
 
+  const labels=lhmLabels(discoveredSensors);
   for(const s of discoveredSensors){
-    const key=`CUSTOM_${s.index}`;
-    if(!SEN[key]){
-      // Assign more specific category based on device group context
-      let cat=getCat(s.type);
-      const devName=(deviceNameMap[s.sensor_index]||'').toLowerCase();
-      if(devName.includes('cpu')||devName.includes('ryzen')||devName.includes('core')||devName.includes('intel'))
-        cat='cpu';
-      else if(devName.includes('gpu')||devName.includes('geforce')||devName.includes('radeon')||devName.includes('rtx')||devName.includes('rx '))
-        cat='gpu';
-      else if(devName.includes('motherboard')||devName.includes('nuvoton')||devName.includes('ite ')||devName.includes('b550')||devName.includes('b650')||devName.includes('x570')||devName.includes('z790'))
-        cat='motherboard';
-      else if(devName.includes('drive')||devName.includes('ssd')||devName.includes('nvme')||devName.includes('wd ')||devName.includes('samsung'))
-        cat='storage';
-      else if(devName.includes('network')||devName.includes('ethernet')||devName.includes('wifi'))
-        cat='network';
-
-      SEN[key]={l:s.name,u:s.unit||'',s:s.sample||0,max:getDefaultMax(s),cat};
-      sensorMap[key]=s.index;
-    }
+    const key=sensorKeyFor(s);
+    const cat=s.category||getCat(s.type);
+    SEN[key]={l:labels[s.id]||s.name,u:s.unit||'',s:s.sample||0,max:getDefaultMax(s),cat};
+    sensorMap[key]=s.id;
   }
 
-  // Auto-map discovered sensor names to standard keys where possible.
-  // These update the sensorMap so the standard keys (CPU_USAGE, GPU_TEMP etc.)
-  // point to the correct HWiNFO index for THIS system.
-  // NOTE: 'CPU (tctl/Tdie)' and 'GPU Core Load' are intentionally excluded —
-  // tctl/Tdie is a duplicate of CPU_TEMP from the same device, and GPU Core Load
-  // is duplicated by GPU_USAGE already in the default palette.
-  const stdNames={
-    'Total CPU Usage':          'CPU_USAGE',
-    'CPU (Tctl/Tdie)':          'CPU_TEMP',   // maps to CPU_TEMP index but NOT added to palette
-    'GPU Temperature':          'GPU_TEMP',
-    'GPU Temperature (HOTSPOT)':null,          // skip
-    'Physical Memory Load':     'RAM_USAGE',
-    'Motherboard':              'MB_TEMP',
-    'Framerate Displayed (avg)':'FRAMERATE',
-  };
-  const AUTO_ADD_TO_PALETTE=new Set(['CPU_USAGE','GPU_TEMP','RAM_USAGE','MB_TEMP']);
+  // The tray app marks which sensor feeds each standard key (CPU_USAGE,
+  // GPU_TEMP, …) on THIS system — show the common ones in the palette.
+  const AUTO_ADD_TO_PALETTE=new Set(['CPU_USAGE','CPU_TEMP','GPU_USAGE','GPU_TEMP','RAM_USAGE','MB_TEMP']);
   for(const s of discoveredSensors){
-    const stdKey=stdNames[s.name];
-    if(stdKey&&SEN[stdKey]){
-      sensorMap[stdKey]=s.index;
-      if(AUTO_ADD_TO_PALETTE.has(stdKey))
-        visibleSensors.add(stdKey);
-    }
+    if(s.std_key&&SEN[s.std_key]&&AUTO_ADD_TO_PALETTE.has(s.std_key))
+      visibleSensors.add(s.std_key);
   }
 
   buildPalette();
@@ -1441,11 +1403,12 @@ async function importSensorList(){
     try{
       const [fh]=await window.showOpenFilePicker({
         id:'ds916sensors',
-        suggestedName:'hwinfo_sensors.json',
+        suggestedName:'lhm_sensors.json',
         types:[{description:'DS916 Sensor File',accept:{'application/json':['.json']}}],
       });
       const text=await (await fh.getFile()).text();
-      applySensorData(JSON.parse(text), fh.name);
+      try{applySensorData(JSON.parse(text), fh.name);}
+      catch(e){toast('Sensor file error: '+e.message,4000);}
       return;
     }catch(e){if(e.name==='AbortError')return;}
   }
@@ -1549,8 +1512,8 @@ function promptSensorImport(){
     <p style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.6">
       Import your system's sensor list so the palette shows all your hardware sensors.<br><br>
       <b style="color:var(--accent)">The file is at:</b><br>
-      <code style="color:var(--text);background:var(--panel2);padding:3px 6px;border-radius:3px;display:inline-block;margin:4px 0">%APPDATA%\DS916Tray\hwinfo_sensors.json</code><br><br>
-      If the file doesn't exist yet, run the DS916 tray app first — it generates the file automatically on startup.
+      <code style="color:var(--text);background:var(--panel2);padding:3px 6px;border-radius:3px;display:inline-block;margin:4px 0">%APPDATA%\DS916Tray\lhm_sensors.json</code><br><br>
+      If the file doesn't exist yet, start LibreHardwareMonitor (with Options → Remote Web Server → Run enabled), then run the DS916 tray app — it generates the file automatically on startup, or use 🔍 Discover Sensors in its tray menu.
     </p>
     <div class="mbtns">
       <button class="btn" onclick="this.closest('.mbg').remove()">Skip for now</button>

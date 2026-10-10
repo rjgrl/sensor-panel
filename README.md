@@ -2,9 +2,9 @@
 
 A fully open-source sensor panel system for the **Jonsbo DS916** (and compatible ArtInChip-based USB LCD screens), built by reverse-engineering the device's USB protocol from scratch.
 
-Design custom themes visually, stream live hardware sensor data from HWiNFO64, and run everything silently in the background — no proprietary software required. Don't want to design from scratch? The built-in **✨ AI Theme Generator** can build a complete, good-looking theme for you in one click.
+Design custom themes visually, stream live hardware sensor data from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor), and run everything silently in the background — no proprietary software required. Don't want to design from scratch? The built-in **✨ AI Theme Generator** can build a complete, good-looking theme for you in one click.
 
-> This project relies entirely on [HWiNFO64](https://www.hwinfo.com) for sensor data. If you find this useful, please consider a [HWiNFO Pro license](https://www.hwinfo.com/buy/) — it removes the shared memory time limit and supports the developer of the tool this whole project is built on.
+> All hardware sensor data comes from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (free, open source, MPL-2.0) — one monitoring app, no time limits, nothing to restart.
 
 ---
 
@@ -140,25 +140,23 @@ Verify it works by opening a Command Prompt and running:
 python --version
 ```
 
-### Step 2 — Install HWiNFO64
+### Step 2 — Install LibreHardwareMonitor
 
-1. Download HWiNFO64 from https://www.hwinfo.com/download/
-2. Install and launch it
-3. Open **Settings** (wrench icon) and go to the **General/User Interface** tab
-4. Enable the following settings:
+1. Download the latest release from https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases and extract it to a permanent folder (e.g. `C:\Program Files\LibreHardwareMonitor`)
+2. Run `LibreHardwareMonitor.exe` — it asks for administrator rights, which it needs to read CPU, motherboard and fan sensors
+3. In the **Options** menu, enable:
 
 | Setting | Why |
 |---------|-----|
-| ✅ **Minimize Main Window on Startup** | Keeps HWiNFO out of the way at startup |
-| ✅ **Minimize Sensors on Startup** | Sensors run in the background |
-| ✅ **Minimize Sensors instead of Closing** | Prevents accidentally stopping sensor data |
-| ✅ **Auto Start** | HWiNFO launches automatically with Windows |
-| ✅ **Shared Memory Support** | **Required** — allows the tray app to read sensor data |
+| ✅ **Remote Web Server → Run** | **Required** — this is how the tray app reads sensor data (`http://127.0.0.1:8085/data.json`) |
+| ✅ **Run On Windows Startup** | LHM starts automatically with Windows |
+| ✅ **Start Minimized** | Keeps LHM out of the way at startup |
+| ✅ **Minimize To Tray** / **Minimize On Close** | Prevents accidentally stopping sensor data |
 
-> **Optional:** Uncheck **Automatic Update** to prevent HWiNFO from showing update popups. If you disable this you will need to manually check for updates at https://www.hwinfo.com
+4. Leave the web server port at its default **8085** (or set the same port in DS916 Settings → LibreHardwareMonitor tab)
+5. LHM will now start minimized to the system tray on every boot. There's no time limit — it can run indefinitely
 
-5. Click **OK** and close Settings
-6. HWiNFO will now start minimized to the system tray on every boot
+> **Switching from HWiNFO64?** You can uninstall HWiNFO64 (or just turn off its Auto Start). Running both at the same time isn't needed, and two monitoring tools polling the same sensor chips can occasionally conflict.
 
 ### Step 3 — Download the Sensor Panel Files
 
@@ -189,8 +187,8 @@ This will:
 2. A small icon appears in your system tray (bottom-right of the taskbar)
 3. The app will:
    - Add itself to Windows startup automatically
-   - Connect to HWiNFO64 shared memory
-   - **Discover all your sensors** and save them to `%APPDATA%\DS916Tray\hwinfo_sensors.json`
+   - Connect to LibreHardwareMonitor's web server
+   - **Discover all your sensors** and save them to `%APPDATA%\DS916Tray\lhm_sensors.json`
    - Create a `%APPDATA%\DS916Tray\Themes\` folder for storing your theme files
 
 > **If you've ever used JONSBO-AIO, make sure it's fully closed** (including from the system tray) before running DS916Tray — both cannot use the COM port at the same time. If you've never installed or used JONSBO-AIO, you can skip this.
@@ -198,7 +196,7 @@ This will:
 ### Step 6 — Design a Theme
 
 1. Right-click the DS916 tray icon and choose **🎨 Open Theme Builder** — this opens `theme_builder.html` directly from its installed location in your browser (you no longer need to find the file manually)
-2. When prompted, click **Browse for file…** and navigate to `%APPDATA%\DS916Tray\hwinfo_sensors.json` to load your system's sensor list
+2. When prompted, click **Browse for file…** and navigate to `%APPDATA%\DS916Tray\lhm_sensors.json` to load your system's sensor list
 3. Design your theme (see [Theme Builder](#theme-builder) section below)
 4. Click **💾 Save Theme** and save to `%APPDATA%\DS916Tray\Themes\`
 
@@ -255,9 +253,9 @@ You can add multiple image layers. Each behaves like any other element — drag 
 | **⏹ Stop Display** | Stop streaming |
 | **📂 Load Theme…** | Load a `.ds916theme` file |
 | **🎨 Open Theme Builder** | Opens `theme_builder.html` in your browser |
-| **🔍 Discover Sensors** | Re-scan HWiNFO64 and update `hwinfo_sensors.json` |
+| **🔍 Discover Sensors** | Re-scan LibreHardwareMonitor and update `lhm_sensors.json` |
 | **ℹ Status…** | Live status: sensor source, COM port, sensor readings |
-| **⚙ Settings…** | COM port, FPS, HWiNFO source, sensor map, auto-restart |
+| **⚙ Settings…** | COM port, FPS, LibreHardwareMonitor connection, RTSS, logging |
 | **🗑 Uninstall…** | Remove from startup and delete app data |
 | **❌ Exit** | Close the tray app |
 
@@ -278,14 +276,11 @@ Open via tray icon → **⚙ Settings…**
 
 > **COM port auto-detection:** the app identifies the DS916 by its USB VID/PID (`33C3:F101`) and automatically updates the COM port setting if it changes between sessions.
 
-### HWiNFO Tab
+### LibreHardwareMonitor Tab
 
-Configures the optional **11.5-hour auto-restart** for HWiNFO64 free edition's shared memory time limit:
-
-1. Click **Detect** to find `HWiNFO64.exe` automatically (needed so the app knows what to relaunch)
-2. Check **"Automatically restart HWiNFO64 before the 12-hour limit"** — **off by default**, since it restarts HWiNFO64 without asking each time. Leave it off if you have HWiNFO Pro (no 12-hour limit) or prefer to restart HWiNFO64 yourself
-3. When enabled, the tray app checks HWiNFO64's actual uptime every 30 minutes and restarts it once it's been running 11.5 hours — no Windows Scheduled Task, no UAC prompt, since restarting an application you already have access to isn't an elevated action
-4. Status shows current HWiNFO64 uptime and time until the next auto-restart
+- **Host / Port** — where LHM's Remote Web Server is listening. Default `127.0.0.1` : `8085`; only change it if you changed the port in LHM
+- **↻ Test Connection** — shows whether LHM is reachable, its version, how many sensors it reports, and how many standard sensor keys were matched on your hardware
+- If the connection fails, check that LHM is running and **Options → Remote Web Server → Run** is ticked
 
 ### RTSS (FPS) Tab
 
@@ -322,7 +317,7 @@ To add decorative image layers on top of the background, use **+ Image** instead
 
 ### Loading Your Sensor List
 
-Click **🔍 Sensors** in the top bar to import `hwinfo_sensors.json`. This loads all sensors from your specific hardware into the palette. Without this file, only standard sensor keys are available.
+Click **🔍 Sensors** in the top bar to import `lhm_sensors.json`. This loads all sensors from your specific hardware into the palette. Without this file, only standard sensor keys are available.
 
 The sensor list is generated automatically by the tray app on every startup. If the file doesn't exist yet, run DS916Tray.exe first.
 
@@ -345,7 +340,7 @@ The sensor list is generated automatically by the tray app on every startup. If 
 
 ### Sensor Palette
 
-The palette shows a curated default set of sensors. Use the **＋ Sensors** button to open the full picker with checkboxes — select any sensor to add it to the palette. Importing a `hwinfo_sensors.json` file adds your hardware-specific sensors (custom fans, liquid cooling temps, per-core data, etc.) to the picker.
+The palette shows a curated default set of sensors. Use the **＋ Sensors** button to open the full picker with checkboxes — select any sensor to add it to the palette. Importing a `lhm_sensors.json` file adds your hardware-specific sensors (custom fans, liquid cooling temps, per-core data, etc.) to the picker.
 
 ### Resizing Elements
 
@@ -398,19 +393,21 @@ From there, treat it like any other theme: drag elements to fine-tune positions,
 
 ## Sensor Discovery
 
-When the tray app starts with HWiNFO64 shared memory enabled, it automatically scans all available sensors and saves them to:
+When the tray app starts and LibreHardwareMonitor is reachable, it automatically scans all available sensors and saves them to:
 
 ```
-%APPDATA%\DS916Tray\hwinfo_sensors.json
+%APPDATA%\DS916Tray\lhm_sensors.json
 ```
 
-This file contains every sensor HWiNFO64 exposes, including hardware-specific sensors like additional fan headers, liquid cooling temperatures, per-core data, and framerate metrics.
+This file contains every sensor LHM exposes, including hardware-specific sensors like additional fan headers, liquid cooling temperatures, per-core clocks/temps/loads and per-drive data. Sensors are labelled with their device name where needed (e.g. `Samsung SSD 990 PRO: Temperature`) so duplicates are easy to tell apart.
 
 **In the Theme Builder**, click **🔍 Sensors** to import this file. All discovered sensors appear in the element palette via the **＋ Sensors** picker.
 
-**Re-run discovery** at any time via tray icon → **🔍 Discover Sensors** — for example after adding new hardware or updating HWiNFO64.
+**Re-run discovery** at any time via tray icon → **🔍 Discover Sensors** — for example after adding new hardware or updating LHM.
 
-> Sensor indices vary between systems and HWiNFO versions. The tray app matches sensors by name (`"Total CPU Usage"`, `"GPU Temperature"`, `"Physical Memory Load"` etc.) rather than by index, so mappings stay correct even if the order changes.
+> Standard keys (`CPU_USAGE`, `GPU_TEMP`, …) are matched by sensor name and hardware type on every read, and sensors you pick from the list are stored by LHM's stable sensor ID (e.g. `/amdcpu/0/temperature/2`) — so nothing goes stale if the sensor order changes.
+>
+> **Themes made with the old HWiNFO sensor list:** standard keys keep working unchanged. Elements bound to a *custom* sensor from the old `hwinfo_sensors.json` (`CUSTOM_<number>`) can't be translated automatically — re-import `lhm_sensors.json` in the Theme Builder, re-pick those sensors and re-save the theme. The tray app logs a warning naming each one.
 
 ### Framerate Sensors
 
@@ -425,7 +422,7 @@ Three additional RTSS sensors are available via the **＋ Sensors** picker but *
 
 These three are **session-based** — they only populate while an RTSS benchmark/recording session is actively running. They will show 0 at all other times. Start a session in RTSS via its OSD benchmark controls if you want these values.
 
-**`FRAMERATE` (via HWiNFO/PresentMon)** is **unreliable without an HWiNFO Pro license** — the free version can't exclude background applications from PresentMon tracking. Available via ＋ Sensors but not in the default palette.
+**`FRAMERATE`** is a legacy key from the HWiNFO version and is no longer populated — LibreHardwareMonitor has no framerate sensor. Use the RTSS keys for FPS.
 
 To set up RTSS:
 1. Install [RivaTuner Statistics Server](https://www.guru3d.com/download/rtss-rivatuner-statistics-server-download/) (also bundled with MSI Afterburner) and make sure it's running
@@ -435,44 +432,27 @@ To set up RTSS:
 
 RTSS is fully optional — if it isn't installed or running, the framerate sensors simply stay unavailable and everything else continues working normally. No administrator privileges are required.
 
-**If `RTSS_FPS` shows 0 or no data for a specific game**, RTSS likely hasn't hooked that game yet. Try raising RTSS's **Application Detection Level** (Options → General) from Low to Medium or High. RTSS's on-screen display can be left **off** and **Stealth Mode** can be left **on** — neither affects shared memory availability.
+**If `RTSS_FPS` shows 0 or no data for a specific game**, RTSS likely hasn't hooked that game yet. Try raising RTSS's **Application Detection Level** (Options → General) from Low to Medium or High. RTSS's on-screen display can be left **off** and **Stealth Mode** can be left **on** — neither affects RTSS's shared memory availability.
 
 ---
 
 ## GPU Vendor Support
 
-NVIDIA and AMD drivers expose hardware sensors to HWiNFO under different names, and AMD in particular splits some metrics (notably power) across multiple separate rails rather than one combined figure. This project's standard sensor keys (`GPU_USAGE`, `GPU_TEMP`, `GPU_FAN1`, `GPU_POWER`, `VRAM_USED`) automatically check the correct vendor-specific sensor name for whichever GPU is installed — you should never need to change which sensor an element is bound to after a GPU swap (NVIDIA ↔ AMD or otherwise); it should just work.
+NVIDIA, AMD and Intel GPUs expose slightly different sensors in LibreHardwareMonitor. This project's standard sensor keys (`GPU_USAGE`, `GPU_TEMP`, `GPU_FAN1`, `GPU_POWER`, `VRAM_USED`, `VRAM_USAGE`) automatically check the right sensor for whichever GPU is installed — you should never need to change which sensor an element is bound to after a GPU swap. A discrete GPU is always preferred over integrated graphics.
 
-A few vendor-specific notes worth knowing:
+A few notes worth knowing:
 
-- **`GPU_POWER`** uses AMD's "Total Board Power (TBP)" sensor, the complete board-level power draw, rather than any single internal power rail (AMD splits power into Core/GFX, SoC, and Memory rails with no single combined sensor of its own — TBP is HWiNFO's own measured total).
-- **`VRAM_USED`** deliberately avoids AMD's "GPU Memory Usage" sensor, which has a [confirmed, longstanding driver bug](https://www.hwinfo.com/forum/threads/abnormal-reporting-of-gpu-memory-usage.9461/) acknowledged by HWiNFO's own author — it can report wildly incorrect values (sometimes hundreds of GB on a card with a fraction of that installed). "GPU D3D Memory Dedicated" is used instead, which is accurate and matches what AMD's own software and Windows Task Manager report.
-- **`VRAM_USAGE`** (the percentage version) has no direct sensor on most AMD cards at all — HWiNFO doesn't expose total VRAM capacity as a sensor on any vendor, since it's static hardware info rather than something that changes over time. To work around this, the tray app keeps a small built-in lookup table of known GPU model names to their VRAM capacity, checked once at startup (or whenever you re-run sensor discovery) against your GPU's device name, then used to compute the percentage from `VRAM_USED` directly. If your specific card model isn't in the table, `VRAM_USAGE` simply stays unavailable rather than guessing — `VRAM_USED` (in GB) keeps working normally either way. The table covers most recent AMD RDNA3/4 and NVIDIA RTX 20/30/40-series cards; if yours is missing, this is a quick addition for anyone comfortable editing `GPU_VRAM_GB` in `ds916_tray.py`.
+- **`GPU_POWER`** uses LHM's "GPU Package" sensor — total board/ASIC power on NVIDIA and AMD — and only falls back to AMD's GFX core rail ("GPU Core") if nothing else exists, since that rail alone under-reports.
+- **`VRAM_USED`** prefers "D3D Dedicated Memory Used" (what Windows Task Manager shows, and accurate on AMD), falling back to the driver's "GPU Memory Used".
+- **`VRAM_USAGE`** (percentage) is computed from `VRAM_USED` ÷ LHM's "GPU Memory Total" for the same card. If LHM doesn't report a total for your GPU, a small built-in table of known card capacities (`GPU_VRAM_GB` in `ds916_tray.py`) is used as a fallback.
 
-If you swap GPUs and a sensor that used to work stops updating, you can check exactly what sensor names your installed GPU reports by reading directly from HWiNFO's shared memory — the `STANDARD_SENSOR_NAMES` candidate lists near the top of `ds916_tray.py` are where new vendor naming patterns would need adding. Open an issue if you find a sensor that needs a new candidate name added for your card.
+If a standard key doesn't update on your hardware, open LHM and look up the exact sensor name, then add it to that key's candidate list in `STANDARD_SENSOR_RULES` near the top of `ds916_tray.py` (or just pick the sensor directly from the ＋ Sensors list). Open an issue if you find a name that should be added.
 
 ---
 
 ## Sensor Update Speed
 
-HWiNFO64 only refreshes sensor values as fast as its own **Polling Period** setting allows (2000ms / 2 seconds by default). If fast-changing sensors like CPU/GPU usage feel sluggish or "jumpy" on the panel — especially on bar/ring elements, which redraw instantly with no smoothing — this is almost always HWiNFO's polling rate, not anything fixable in this project. Lowering it in HWiNFO64's settings (gear icon → General Settings → Polling Period) to somewhere in the 500-1000ms range is a commonly used middle ground for a snappier feel, at a small CPU cost to HWiNFO itself. See the [HWiNFO Setup wiki page](https://github.com/mike-novotny/sensor-panel/wiki/HWiNFO-Setup#sensor-update-speed-polling-period) for the full breakdown and caveats.
-
----
-
-## HWiNFO64 Shared Memory — 12-Hour Limit
-
-HWiNFO64 free edition disables shared memory after 12 hours of continuous operation. When this happens, sensor values will stop updating until HWiNFO64 is restarted.
-
-**Solutions:**
-
-1. **Auto-restart** (optional, off by default) — Settings → HWiNFO tab → check "Automatically restart HWiNFO64 before the 12-hour limit." The tray app checks HWiNFO64's real uptime every 30 minutes and restarts it once it's been running 11.5 hours, with no Scheduled Task and no UAC prompt involved
-2. **Manual restart** — restart HWiNFO64 manually when needed; the tray app will automatically reconnect to the fresh shared memory session within a moment
-
-This is off by default since it restarts HWiNFO64 without asking each time — leave it off if you'd rather restart manually, or if you have HWiNFO Pro and the limit doesn't apply to you anyway.
-
-Check the current status at any time via tray icon → **ℹ Status…**
-
-> **Please consider supporting HWiNFO64.** This entire project depends on HWiNFO's excellent and freely available sensor monitoring engine — without it, none of this would be possible. A [HWiNFO Pro license](https://www.hwinfo.com/buy/) removes the 12-hour shared memory limit entirely (making the restart workaround unnecessary), adds remote monitoring, and supports continued development of a tool the whole PC hardware community relies on. It's inexpensive and a fair trade for the years of free, high-quality work that's gone into it.
+LibreHardwareMonitor refreshes its sensors once per second by default (Options → Update Interval). The tray app re-reads LHM at most twice a second, so the panel is never more than one LHM refresh behind. If fast-changing sensors like CPU/GPU usage feel sluggish, lower LHM's update interval — at a small CPU cost to LHM itself.
 
 ---
 
@@ -481,7 +461,7 @@ Check the current status at any time via tray icon → **ℹ Status…**
 Right-click tray icon → **ℹ Status…** to see a live dashboard:
 
 - **Display** — streaming status, COM port, FPS, active theme name and resolution
-- **HWiNFO64 Sensor Source** — shows `Shared Memory ✅` or an unavailable warning if HWiNFO64 isn't running, plus current HWiNFO64 uptime and auto-restart status
+- **Sensor Source — LibreHardwareMonitor** — web server address `✅`, LHM version and how many sensors / standard keys were found, or an unavailable warning if LHM isn't running or its web server is off
 - **Live Sensor Snapshot** — current values for CPU/GPU usage and temperature, motherboard temp, CPU fan
 - **System** — Windows startup status
 
@@ -557,30 +537,36 @@ Themes are saved as a single **`.ds916theme`** file — a JSON document with all
 
 ### Standard Sensor Keys
 
-| Key | HWiNFO Source Name(s) |
+| Key | LibreHardwareMonitor source (first match wins) |
 |-----|-------------------|
-| `CPU_USAGE` | Total CPU Usage |
-| `CPU_TEMP` | CPU (Tctl/Tdie) — AMD, *or* CPU Package — Intel |
-| `CPU_FAN` | CPU1 |
-| `GPU_USAGE` | GPU Core Load — NVIDIA, *or* GPU Utilization — AMD |
-| `GPU_TEMP` | GPU Temperature |
-| `GPU_FAN1` | GPU Fan1 — multi-fan NVIDIA cards, *or* GPU Fan — AMD (single fan sensor) |
-| `GPU_POWER` | GPU Power — NVIDIA, *or* Total Board Power (TBP) — AMD |
-| `VRAM_USED` | GPU Memory Used — NVIDIA, *or* GPU D3D Memory Dedicated — AMD (AMD's "GPU Memory Usage" sensor is a [confirmed driver bug](https://www.hwinfo.com/forum/threads/abnormal-reporting-of-gpu-memory-usage.9461/) and is deliberately avoided) |
-| `VRAM_USAGE` | Computed automatically as VRAM_USED ÷ detected card capacity, for AMD cards in our built-in lookup table (see [GPU Vendor Support](#gpu-vendor-support) below). NVIDIA may expose this directly. |
-| `MB_TEMP` | Motherboard |
-| `CHASSIS_FAN1/2/3` | Chassis1 / Chassis2 / Chassis3 |
-| `RAM_USAGE` | Physical Memory Load |
-| `RAM_USED_GB` | Physical Memory Used |
-| `RAM_TOTAL` | Physical Memory Total |
-| `DISK_READ` / `DISK_WRITE` | Read Rate / Write Rate |
-| `NET_DOWN` / `NET_UP` | Current DL rate / Current UP rate |
-| `FRAMERATE` | Framerate Displayed (avg) — via HWiNFO/PresentMon, unreliable w/o Pro |
+| `CPU_USAGE` | CPU › Load › CPU Total |
+| `CPU_TEMP` | CPU › Core (Tctl/Tdie) — AMD, *or* CPU Package — Intel (motherboard "CPU" sensor as fallback) |
+| `CPU_FREQ` | CPU › Cores (Average), else Core #1 |
+| `CPU_POWER` | CPU › Package |
+| `CPU_VOLTAGE` | CPU › Core (SVI2 TFN) — AMD, *or* CPU Core — Intel (motherboard Vcore as fallback) |
+| `CPU_FAN` | Motherboard › CPU Fan |
+| `GPU_USAGE` / `GPU_TEMP` / `GPU_FREQ` | GPU › GPU Core (load / temperature / clock) |
+| `GPU_FAN1` / `GPU_FAN2` | GPU › GPU Fan 1 / GPU Fan 2 (or GPU Fan on single-fan-sensor cards) |
+| `GPU_POWER` | GPU › GPU Package |
+| `VRAM_USED` | GPU › D3D Dedicated Memory Used, else GPU Memory Used (GB) |
+| `VRAM_USAGE` | Computed: VRAM_USED ÷ GPU Memory Total |
+| `MB_TEMP` | Motherboard › Motherboard / System |
+| `CHASSIS_FAN1/2/3` | Motherboard › System Fan #1/#2/#3 or Chassis Fan #1/#2/#3 |
+| `RAM_USAGE` | Memory › Load › Memory |
+| `RAM_USED_GB` / `RAM_FREE_GB` | Memory › Memory Used / Memory Available |
+| `RAM_TOTAL` | Computed: used + available |
+| `DISK_USAGE` / `DISK_USED` / `DISK_FREE` | Windows system drive (read directly from Windows, not LHM) |
+| `DISK_TEMP` | First drive › Temperature |
+| `DISK_READ` / `DISK_WRITE` | First drive › Read Rate / Write Rate (MB/s) |
+| `NET_DOWN` / `NET_UP` | Busiest network adapter › Download Speed / Upload Speed (MB/s) |
+| `BATTERY` | Battery › Charge Level |
+| `NET_PING` | Not available from LHM |
+| `FRAMERATE` | Not available from LHM — use RTSS |
 | `RTSS_FPS` | **Framerate — Live (RTSS)** — recommended, continuously-updating ring buffer (default palette) |
 | `RTSS_FPS_MIN` | Framerate Min — Session (RTSS) — opt-in, only populated during active benchmark session |
 | `RTSS_FPS_MAX` | Framerate Max — Session (RTSS) — opt-in, only populated during active benchmark session |
 | `RTSS_FPS_AVG` | Framerate Avg — Session (RTSS) — opt-in, only populated during active benchmark session |
-| `CUSTOM_N` | Any sensor at shared memory index N |
+| `CUSTOM_…` | Any sensor picked from `lhm_sensors.json`, stored by its LHM sensor ID |
 
 ---
 
@@ -615,7 +601,7 @@ Pull requests welcome. Areas that would benefit most:
 
 - **More compatible devices** — test on other ArtInChip-based panels
 - **Theme gallery** — share your `.ds916theme` files in Discussions
-- **Linux/Mac support** — protocol is the same; HWiNFO integration would need replacing (e.g. `lm-sensors`)
+- **Linux/Mac support** — protocol is the same; the LibreHardwareMonitor reader would need replacing (e.g. `lm-sensors`)
 - **More sensor keys** — per-core temps, disk activity, GPU power, etc.
 
 ---
@@ -629,7 +615,6 @@ MIT — do whatever you want with it.
 ## Acknowledgements
 
 Protocol reverse-engineered using Wireshark + USBPcap on Windows 11.
-HWiNFO shared memory format: https://gist.github.com/namazso/0c37be5a53863954c8c8279f66cfb1cc
 ArtInChip Luban-Lite SDK: https://github.com/artinchip/luban-lite
 CherryUSB: https://github.com/cherry-embedded/CherryUSB
-HWiNFO64: https://www.hwinfo.com
+LibreHardwareMonitor: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor

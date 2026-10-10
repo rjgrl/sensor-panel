@@ -65,16 +65,15 @@ DEFAULT_CFG = {
     'fps':        6,
     'theme_path': '',
     'autostart':  True,
-    'hwinfo_path': '',
+    'lhm_host':   '127.0.0.1',       # LibreHardwareMonitor Remote Web Server host
+    'lhm_port':   8085,              # ...and port (LHM default is 8085)
     'rtss_process': '',              # empty = auto-detect active 3D app; or an exact exe name (e.g. "game.exe") to pin a specific process
     'log_level': 'normal',           # 'off', 'normal', or 'verbose' -- see Logging section above
-    'hwinfo_auto_restart': False,    # opt-in: if True, periodically check HWiNFO64's uptime and restart it before the 12h shared-memory limit -- see check_hwinfo_restart_needed(). Off by default so we never restart HWiNFO64 without explicit permission, and so Pro license holders (no 12h limit) aren't restarted needlessly.
-    'hwinfo_pro': False,               # if True, use '-sensors' flag when restarting HWiNFO64 (Pro feature). Free version rejects command-line params.
     # Note: there is no persisted sensor index map here. Standard sensor
     # keys (CPU_USAGE, GPU_TEMP, etc.) are resolved fresh by NAME on every
-    # single read inside read_sharedmem() -- nothing is ever cached across
-    # restarts, so there is nothing that can go stale if HWiNFO's internal
-    # sensor ordering shifts (driver update, new device added, etc.).
+    # single read inside lhm_read_values() -- nothing is ever cached across
+    # restarts, so there is nothing that can go stale if the sensor
+    # ordering shifts (driver update, new device added, etc.).
     # CUSTOM_N entries for sensors with no standard name come from the
     # currently loaded theme's own sensorMap instead of a global config.
 }
@@ -88,8 +87,11 @@ def load_cfg():
         # Drop any leftover sensor_map from an older config version -- it's
         # no longer used for anything and keeping it around risks confusion
         # (and was the source of a real bug: a stale cached index could
-        # silently persist forever across HWiNFO restarts/reorderings).
+        # silently persist forever across sensor-source restarts/reorderings).
         c.pop('sensor_map', None)
+        # HWiNFO64 settings from before the switch to LibreHardwareMonitor
+        for old_key in ('hwinfo_path', 'hwinfo_auto_restart', 'hwinfo_pro'):
+            c.pop(old_key, None)
         return c
     except: return dict(DEFAULT_CFG)
 
@@ -126,244 +128,388 @@ def make_frame(jpeg, first=False):
     struct.pack_into('<I', h,  8, len(jpeg)+60)
     return bytes(h)+jpeg
 
-# ── HWiNFO Reader ─────────────────────────────────────────────────────────────
-_shm_handle = None
-_shm_data   = None
+# ── LibreHardwareMonitor Reader ───────────────────────────────────────────────
+# Sensor values come from LibreHardwareMonitor's built-in Remote Web Server
+# (Options -> Remote Web Server -> Run in LHM), which serves the full sensor
+# tree as JSON at http://<host>:<port>/data.json (default port 8085).
+#
+# This is pure stdlib (urllib + json) -- no extra Python dependencies, no
+# shared memory, no 12-hour limit, and nothing to restart. LHM itself needs
+# to run as administrator (it does by default) to read most hardware sensors.
+#
+# Every node in data.json looks like:
+#   {"id": 3, "Text": "Core (Tctl/Tdie)", "Min": "...", "Value": "45.3 °C",
+#    "Max": "...", "SensorId": "/amdcpu/0/temperature/2", "Type": "Temperature",
+#    "RawValue": 45.25, "HardwareId": "...", "Children": [...]}
+# Older LHM releases omit RawValue/Type/HardwareId -- everything here falls
+# back to parsing the formatted Value string and the SensorId path instead.
+import re as _re
+import urllib.request as _urlreq
 
-def try_open_sharedmem():
-    """Try to open HWiNFO shared memory using pure ctypes."""
-    global _shm_handle, _shm_data
-    log.debug('Attempting to open HWiNFO shared memory...')
-    try:
-        import ctypes
+_lhm_snapshot      = None   # list of flattened sensor dicts from the last good fetch
+_lhm_snapshot_time = 0.0    # time.time() of that fetch
+_lhm_version       = None   # LHM version string reported by data.json (if any)
+_lhm_connected     = False  # True once the last fetch succeeded
+_lhm_last_fail     = 0.0    # time.time() of the last failed fetch (for retry backoff)
+_lhm_fail_logged   = False
+_lhm_lock          = threading.Lock()
 
-        kernel32      = ctypes.windll.kernel32
-        FILE_MAP_READ = 0x0004
+LHM_CACHE_SECONDS  = 0.5    # LHM itself only refreshes ~1x/sec; no need to fetch every frame
+LHM_RETRY_SECONDS  = 5.0    # while LHM is unreachable, only retry this often so frames don't stall
+LHM_TIMEOUT        = 1.0    # seconds -- localhost answers in a few ms when LHM is running
 
-        # Set correct return types — default c_int truncates 64-bit pointers
-        kernel32.OpenFileMappingW.restype  = ctypes.c_void_p
-        kernel32.MapViewOfFile.restype     = ctypes.c_void_p
-        kernel32.UnmapViewOfFile.argtypes  = [ctypes.c_void_p]
-        kernel32.CloseHandle.argtypes      = [ctypes.c_void_p]
-
-        # Open the named file mapping
-        win_handle = None
-        for name in ('Global\\HWiNFO_SENS_SM2', 'HWiNFO_SENS_SM2'):
-            h = kernel32.OpenFileMappingW(FILE_MAP_READ, False, name)
-            if h:
-                win_handle = h
-                log.debug(f'  Opened mapping: "{name}" handle={h}')
-                break
-
-        if not win_handle:
-            raise OSError(
-                'OpenFileMappingW failed — HWiNFO64 not running or '
-                'Shared Memory Support not enabled.\n'
-                '  In HWiNFO64: Settings → General → Shared Memory Support')
-
-        # Map into our address space
-        SM_SIZE = 1 * 1024 * 1024  # 1MB
-        ptr = kernel32.MapViewOfFile(win_handle, FILE_MAP_READ, 0, 0, SM_SIZE)
-        if not ptr:
-            kernel32.CloseHandle(win_handle)
-            raise OSError(f'MapViewOfFile failed (error {kernel32.GetLastError()})')
-        log.debug(f'  MapViewOfFile ptr=0x{ptr:X}')
-
-        # Read using ctypes.string_at — this is the correct way to read
-        # from a raw memory address in Python on Windows
-        sig_bytes = ctypes.string_at(ptr, 4)
-        sig = struct.unpack('<I', sig_bytes)[0]
-        log.debug(f'  Signature: 0x{sig:08X} (WIFH=0x57494648, SiWH=0x53695748)')
-
-        VALID_SIGS = {0x57494648, 0x53695748}
-        if sig not in VALID_SIGS:
-            kernel32.UnmapViewOfFile(ptr)
-            kernel32.CloseHandle(win_handle)
-            raise OSError(f'Unknown signature 0x{sig:08X} — HWiNFO still loading?')
-
-        # Store both so we can read later and keep alive
-        # Decode layout using reverse-engineered struct (github.com/namazso/hwinfosharedmem.h)
-        hdr   = ctypes.string_at(ptr, 48)
-        off_e = struct.unpack_from('<I', hdr, 0x20)[0]
-        sz_e  = struct.unpack_from('<I', hdr, 0x24)[0]
-        n_e   = struct.unpack_from('<I', hdr, 0x28)[0]
-        log.debug(f'  Entries: {n_e} @ offset {off_e}, {sz_e} bytes each')
-        # Store 7-tuple: kernel32, win_handle, ptr, SM_SIZE, off_e, sz_e, n_e
-        _shm_handle = (kernel32, win_handle, ptr, SM_SIZE, off_e, sz_e, n_e)
-        _shm_data   = True
-        log.info('HWiNFO shared memory connected OK')
-        return True
-
-    except Exception as e:
-        log.warning(f'HWiNFO shared memory open failed: {e}')
-        _shm_handle = None
-        _shm_data   = None
-        return False
-
-
-# Canonical HWiNFO sensor names for each standard sensor key. Looked up by
-# NAME on every single read (like the RTSS reader already does for process
-# names) rather than caching a numeric index anywhere — this is what
-# actually eliminates the staleness problem: there's nothing to go stale
-# if nothing is ever persisted across HWiNFO restarts/reorderings.
-STANDARD_SENSOR_NAMES = {
-    'CPU_USAGE':    ['Total CPU Usage'],
-    'CPU_TEMP':     ['CPU (Tctl/Tdie)', 'CPU Package', 'CPU Temperature'],
-    'CPU_FAN':      ['CPU1', 'CPU Fan', 'CPU_OPT'],
-    'CPU_FREQ':     ['CPU Clock', 'Core Clocks (avg)'],
-    'CPU_POWER':    ['CPU Package Power', 'CPU Power'],
-    'CPU_VOLTAGE':  ['CPU Core Voltage', 'Vcore'],
-    'GPU_USAGE':    ['GPU Core Load', 'GPU Usage', 'GPU Load', 'GPU Utilization'],
-    'GPU_TEMP':     ['GPU Temperature', 'GPU Temp'],
-    'GPU_FAN1':     ['GPU Fan1', 'GPU Fan 1', 'GPU Fan'],   # AMD cards commonly report a single 'GPU Fan' rather than separate Fan1/Fan2 - falls back here
-    'GPU_FAN2':     ['GPU Fan2', 'GPU Fan 2'],
-    'GPU_FREQ':     ['GPU Clock'],
-    'GPU_POWER':    ['GPU Power', 'Total Board Power (TBP)', ('GPU Core Power (VDDCR_GFX)', 1)],   # 'Total Board Power (TBP)' confirmed via HWiNFO's GPU sensor group on AMD RX 9070 XT -- a real measured total power draw, not a sum HWiNFO computes itself. Falls back to the GFX core rail only if TBP isn't available at all (underreports total power in that case, since it excludes SoC/memory rails).
-    'VRAM_USAGE':   ['GPU Memory Load'],   # percentage-based VRAM usage (NVIDIA-style naming) - AMD does not expose a reliable percentage equivalent; see note in read_sharedmem()
-    'VRAM_USED':    ['GPU Memory Used', ('GPU D3D Memory Dedicated', 1/1024), ('GPU Memory Usage', 1/1024)],   # 'GPU Memory Usage' is a CONFIRMED-BUGGY AMD driver value -- HWiNFO's own author (Martin) states on the HWiNFO forum (hwinfo.com/forum/threads/abnormal-reporting-of-gpu-memory-usage.9461/) that this is unreliable on AMD GPUs and recommends watching the GPU D3D Memory values instead. 'GPU D3D Memory Dedicated' (in MB, converted to GB here) is the correct, AMD-recommended replacement and is tried first; the buggy sensor is kept only as a last-resort fallback for systems where D3D Memory Dedicated isn't exposed at all.
-    'RAM_USAGE':    ['Physical Memory Load'],
-    'RAM_USED_GB':  ['Physical Memory Used'],
-    'RAM_FREE_GB':  ['Physical Memory Available'],
-    'RAM_TOTAL':    ['Physical Memory Total'],
-    'DISK_USAGE':   ['Disk Usage'],
-    'DISK_USED':    ['Disk Used'],
-    'DISK_FREE':    ['Disk Free'],
-    'DISK_TEMP':    ['Drive Temperature'],
-    'DISK_READ':    ['Read Rate', 'Disk Read Rate'],
-    'DISK_WRITE':   ['Write Rate', 'Disk Write Rate'],
-    'MB_TEMP':      ['Motherboard'],
-    'CHASSIS_FAN1': ['Chassis1', 'Chassis Fan 1', 'CHA_FAN1'],
-    'CHASSIS_FAN2': ['Chassis2', 'Chassis Fan 2', 'CHA_FAN2'],
-    'CHASSIS_FAN3': ['Chassis3', 'Chassis Fan 3', 'CHA_FAN3'],
-    'NET_DOWN':     ['Current DL rate', 'Download rate'],
-    'NET_UP':       ['Current UP rate', 'Upload rate'],
-    'NET_PING':     ['Ping'],
-    'BATTERY':      ['Battery Charge Level'],
-    # FRAMERATE intentionally not auto-mapped — HWiNFO's PresentMon
-    # tracking is unreliable without an HWiNFO Pro license; users who
-    # want to try it anyway can wire up a CUSTOM_N key manually.
+# Hardware identifier prefix (first path segment of SensorId/HardwareId) -> category
+_LHM_HW_CATEGORY = {
+    'amdcpu': 'cpu', 'intelcpu': 'cpu', 'genericcpu': 'cpu', 'cpu': 'cpu',
+    'gpu-nvidia': 'gpu', 'gpu-amd': 'gpu', 'gpu-intel': 'gpu', 'gpu-ati': 'gpu',
+    'nvidiagpu': 'gpu', 'atigpu': 'gpu',
+    'gpu-intel-integrated': 'igpu',
+    'ram': 'ram', 'vram': 'vram',
+    'lpc': 'mb', 'motherboard': 'mb', 'mainboard': 'mb', 'ec': 'mb', 'smbios': 'mb',
+    'hdd': 'storage', 'ssd': 'storage', 'nvme': 'storage', 'ata': 'storage', 'scsi': 'storage',
+    'usb': 'storage', 'sd': 'storage', 'mmc': 'storage', 'raid': 'storage', 'sas': 'storage',
+    'storage': 'storage',
+    'nic': 'nic',
+    'battery': 'battery',
+    'psu': 'psu',
 }
 
-def read_sharedmem(sensor_map=None):
-    """Read sensor values from HWiNFO shared memory, resolving every
-    standard sensor key (and any CUSTOM_N keys) fresh by NAME on every
-    call. No numeric index is ever cached in config.json — if HWiNFO's
-    internal sensor ordering shifts after a restart, driver update, or
-    new device being added, this re-resolves correctly on the very next
-    read with no stale state possible.
+# SensorId type segment ("/amdcpu/0/temperature/2" -> "temperature") -> LHM SensorType name.
+# Only needed for older LHM versions whose data.json has no "Type" field.
+_LHM_TYPE_FROM_ID = {
+    'voltage': 'Voltage', 'current': 'Current', 'power': 'Power', 'clock': 'Clock',
+    'temperature': 'Temperature', 'load': 'Load', 'frequency': 'Frequency', 'fan': 'Fan',
+    'flow': 'Flow', 'control': 'Control', 'level': 'Level', 'factor': 'Factor',
+    'data': 'Data', 'smalldata': 'SmallData', 'throughput': 'Throughput',
+    'timespan': 'TimeSpan', 'energy': 'Energy', 'noise': 'Noise', 'timing': 'Timing',
+    'conductivity': 'Conductivity', 'humidity': 'Humidity',
+}
 
-    sensor_map is accepted for backwards compatibility (CUSTOM_N entries
-    from older saved themes may still carry a literal index) but standard
-    keys always resolve by name, ignoring any cached index for them.
+_BYTE_UNITS = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4,
+               'KIB': 1024, 'MIB': 1024**2, 'GIB': 1024**3, 'TIB': 1024**4}
+_GB = 1024**3
+_MB = 1024**2
 
-    Layout from: github.com/namazso/hwinfosharedmem.h
-    HWiNFOEntry: type(4) sensor_index(4) id(4) name_orig(128) name_user(128) unit(16) value(8d)
-    Value is a double at offset 0x11C = 284 within each entry.
-    """
-    global _shm_handle
-    data = {}
-    if not _shm_handle: return data
+def _lhm_url():
+    host = (cfg.get('lhm_host') or '127.0.0.1').strip() or '127.0.0.1'
     try:
-        import ctypes
-        kernel32, win_handle, ptr, SM_SIZE, off_e, sz_e, n_e = _shm_handle
-        ptr = int(ptr)
-        if not ptr or sz_e < 285 or n_e <= 0: return data
+        port = int(cfg.get('lhm_port') or 8085)
+    except (TypeError, ValueError):
+        port = 8085
+    return f'http://{host}:{port}/data.json'
 
-        # Re-verify the signature on every read. If HWiNFO64 restarts (e.g.
-        # after the free version's 12-hour shared memory limit kicks in and
-        # the user restarts it), the OLD mapping we have open becomes stale
-        # — Windows may have destroyed and recreated the section under the
-        # same name. Without this check we'd keep silently failing forever
-        # on a dead handle, since _shm_handle would never go back to None
-        # and try_open_sharedmem() would never be called again.
-        VALID_SIGS = {0x57494648, 0x53695748}
-        sig_bytes = ctypes.string_at(ptr, 4)
-        sig = struct.unpack('<I', sig_bytes)[0]
-        if sig not in VALID_SIGS:
-            log.info('HWiNFO shared memory signature is now invalid (stale handle after a restart) - reconnecting next read')
-            try:
-                kernel32.UnmapViewOfFile(ptr)
-                kernel32.CloseHandle(win_handle)
-            except Exception:
-                pass
-            _shm_handle = None
-            return data
+def _parse_formatted(text):
+    """'45.3 °C' -> (45.3, '°C'); '1,5 GB' -> (1.5, 'GB'). Returns (None, '') if
+    the string has no leading number. Handles comma decimal separators, which
+    LHM uses on non-English Windows locales."""
+    if not isinstance(text, str):
+        return None, ''
+    m = _re.match(r'\s*(-?[\d.,]+)\s*(.*)$', text)
+    if not m:
+        return None, ''
+    num, unit = m.group(1), m.group(2).strip()
+    if ',' in num and '.' not in num:
+        num = num.replace(',', '.')
+    else:
+        num = num.replace(',', '')
+    try:
+        return float(num), unit
+    except ValueError:
+        return None, unit
 
-        VALUE_OFFSET = 0x11C  # 284 — double at this offset within HWiNFOEntry
+def _lhm_normalize(stype, raw, text):
+    """Return the sensor's value in a canonical unit:
+         Temperature -> °C, Data/SmallData -> bytes, Throughput -> bytes/s,
+         everything else -> LHM's native unit (%, MHz, W, V, RPM, ...).
+    Data-sized sensors are converted via the formatted string's own unit,
+    because LHM changed Data's raw unit between releases (GB in older ones,
+    bytes in newer ones) and SmallData (MB) no longer exists in newer ones."""
+    parsed, unit = _parse_formatted(text)
+    if stype in ('Data', 'SmallData', 'Throughput'):
+        u = unit.upper().replace('/S', '').strip()
+        if parsed is not None and u in _BYTE_UNITS:
+            return parsed * _BYTE_UNITS[u]
+        if raw is not None:
+            # Formatted string unusable -- fall back to raw with the classic units
+            return raw * {'Data': _GB, 'SmallData': _MB}.get(stype, 1)
+        return None
+    if stype == 'Temperature':
+        if raw is not None:
+            return raw                       # LHM's raw value is always °C
+        if parsed is not None and '°F' in unit:
+            return (parsed - 32) / 1.8       # GUI set to Fahrenheit, older LHM w/o RawValue
+        return parsed
+    if raw is not None:
+        return raw
+    return parsed
 
-        # Build name -> (index, value) for every entry in ONE pass, then
-        # resolve every standard key against it by name. This is the same
-        # cost as before (one scan of all entries per read) but eliminates
-        # any persisted index entirely.
-        name_to_val = {}
-        for idx in range(n_e):
-            entry_ptr = ptr + off_e + idx * sz_e
-            name_bytes = ctypes.string_at(entry_ptr + 0x0C, 128)
-            name = name_bytes.rstrip(b'\x00').decode('ascii', 'replace').strip()
-            if not name: continue
-            val_bytes = ctypes.string_at(entry_ptr + VALUE_OFFSET, 8)
-            val = struct.unpack('<d', val_bytes)[0]
-            name_to_val[name] = val
+def _lhm_flatten(root):
+    """Walk the data.json tree into a flat list of sensor dicts."""
+    out = []
+    def walk(node, hw_name, hw_id, group_text):
+        children = node.get('Children') or []
+        sid = node.get('SensorId')
+        if sid:
+            parts = [p for p in sid.split('/') if p]
+            # "/amdcpu/0/temperature/2" -> hardware "/amdcpu/0", type "temperature"
+            this_hw_id = hw_id or ('/' + '/'.join(parts[:-2]) if len(parts) > 2 else '')
+            stype = node.get('Type') or _LHM_TYPE_FROM_ID.get(parts[-2].lower() if len(parts) >= 2 else '', group_text or '')
+            prefix = (this_hw_id.strip('/').split('/') or [''])[0].lower()
+            raw = node.get('RawValue')
+            if isinstance(raw, str):
+                raw = None
+            text = node.get('Value', '')
+            out.append({
+                'id':       sid,
+                'name':     (node.get('Text') or '').strip(),
+                'type':     stype,
+                'hardware': hw_name,
+                'hw_id':    this_hw_id,
+                'category': _LHM_HW_CATEGORY.get(prefix, 'other'),
+                'value':    _lhm_normalize(stype, raw, text),
+                'text':     text,
+            })
+            return
+        # A node is a hardware node if LHM tags it with HardwareId, or (older
+        # versions) if its grandchildren are sensors. Group nodes ("Temperatures",
+        # "Load", ...) sit between hardware and sensors.
+        is_hw = bool(node.get('HardwareId'))
+        if not is_hw and children:
+            grandkids = [gc for g in children for gc in (g.get('Children') or [])]
+            is_hw = any(gc.get('SensorId') for gc in grandkids)
+        if is_hw:
+            for c in children:
+                walk(c, (node.get('Text') or '').strip(), node.get('HardwareId') or '', None)
+        else:
+            gt = (node.get('Text') or '').strip()
+            for c in children:
+                walk(c, hw_name, hw_id, gt or group_text)
+    walk(root, None, '', None)
+    return out
 
-        for key, candidates in STANDARD_SENSOR_NAMES.items():
-            for cand in candidates:
-                # Candidates are either a plain sensor name (string), or a
-                # (name, multiplier) tuple when a vendor/driver reports the
-                # same metric in different units than this key expects --
-                # e.g. AMD's 'GPU Memory Usage' is in MB while VRAM_USED
-                # expects GB, so it's listed as ('GPU Memory Usage', 1/1024).
-                if isinstance(cand, tuple):
-                    cname, multiplier = cand
-                else:
-                    cname, multiplier = cand, 1
-                if cname in name_to_val:
-                    data[key] = name_to_val[cname] * multiplier
-                    break
+def lhm_fetch(force=False):
+    """Fetch and cache LHM's sensor snapshot. Returns the flattened sensor
+    list, or None if LHM isn't reachable. Cheap to call every frame: results
+    are cached for LHM_CACHE_SECONDS, and while LHM is unreachable a new
+    attempt is only made every LHM_RETRY_SECONDS so the display loop never
+    stalls waiting on a dead connection."""
+    global _lhm_snapshot, _lhm_snapshot_time, _lhm_version, _lhm_connected
+    global _lhm_last_fail, _lhm_fail_logged
+    with _lhm_lock:
+        now = time.time()
+        if not force:
+            if _lhm_connected and now - _lhm_snapshot_time < LHM_CACHE_SECONDS:
+                return _lhm_snapshot
+            if not _lhm_connected and now - _lhm_last_fail < LHM_RETRY_SECONDS:
+                return None
+        url = _lhm_url()
+        try:
+            req = _urlreq.Request(url, headers={'Accept': 'application/json'})
+            # Bypass any system proxy -- this is always a local/LAN request
+            opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
+            with opener.open(req, timeout=LHM_TIMEOUT) as resp:
+                root = json.loads(resp.read().decode('utf-8-sig', 'replace'))
+            sensors = _lhm_flatten(root)
+            if not sensors:
+                raise ValueError('data.json contained no sensors')
+            _lhm_snapshot = sensors
+            _lhm_snapshot_time = now
+            _lhm_version = root.get('Version')
+            if not _lhm_connected:
+                log.info(f'LibreHardwareMonitor connected ({url}, version {_lhm_version or "unknown"}, '
+                         f'{len(sensors)} sensors)')
+            _lhm_connected = True
+            _lhm_fail_logged = False
+            return sensors
+        except Exception as e:
+            if _lhm_connected or not _lhm_fail_logged:
+                log.warning(f'LibreHardwareMonitor not reachable at {url}: {e} -- make sure LHM is running '
+                            f'and Options -> Remote Web Server -> Run is enabled. Will keep retrying.')
+                _lhm_fail_logged = True
+            _lhm_connected = False
+            _lhm_last_fail = now
+            return None
 
-        # VRAM_USAGE (percentage): no direct sensor exists for this on most
-        # AMD cards (and isn't always reliable on NVIDIA either). If we
-        # weren't able to resolve it directly above, compute it ourselves
-        # from VRAM_USED (GB) and the card's known total capacity, looked
-        # up once at startup via detect_gpu_vram_capacity(). If the card
-        # isn't in our known-capacity database, VRAM_USAGE simply stays
-        # unavailable rather than guessing.
-        if 'VRAM_USAGE' not in data and 'VRAM_USED' in data and _detected_vram_gb:
-            data['VRAM_USAGE'] = min(100.0, (data['VRAM_USED'] / _detected_vram_gb) * 100.0)
+def lhm_is_connected():
+    return _lhm_connected
 
-        # CUSTOM_N keys (manually wired sensors not covered by the standard
-        # name table above) still use whatever literal index was saved with
-        # the theme/sensor_map, since there's no name to re-resolve against
-        # for an arbitrary user-picked index.
-        if sensor_map:
-            for skey, idx in sensor_map.items():
-                if not skey.startswith('CUSTOM_') or idx is None: continue
-                if idx >= n_e: continue
-                entry_ptr = ptr + off_e + idx * sz_e
-                val_bytes = ctypes.string_at(entry_ptr + VALUE_OFFSET, 8)
-                data[skey] = struct.unpack('<d', val_bytes)[0]
 
+# Standard sensor keys -> rules for finding them in LibreHardwareMonitor's tree.
+# Resolved by NAME on every read (nothing index-based is ever cached), so
+# hardware changes, driver updates or LHM upgrades can't leave a stale mapping.
+#
+# Each rule: (categories, sensor type, [candidate names in priority order], unit)
+#   categories - hardware categories to search, in priority order (see _LHM_HW_CATEGORY);
+#                'gpu' (discrete) is always searched before 'igpu' (integrated)
+#   unit       - conversion from the canonical unit (see _lhm_normalize):
+#                None = as-is, 'GB' = bytes->GB, 'MB/s' = bytes/s->MB/s
+# Several rules per key are tried in order; the first sensor found wins.
+STANDARD_SENSOR_RULES = {
+    'CPU_USAGE':    [(('cpu',), 'Load', ['CPU Total'], None)],
+    'CPU_TEMP':     [(('cpu',), 'Temperature', ['Core (Tctl/Tdie)', 'CPU Package', 'Core (Tdie)',
+                                                 'Core (Tctl)', 'Package', 'Core Average', 'CPU Cores'], None),
+                     (('mb',),  'Temperature', ['CPU', 'CPU Package', 'CPU Core'], None)],
+    'CPU_FAN':      [(('mb',),  'Fan', ['CPU Fan', 'CPU Fan #1', 'CPU', 'Fan #1'], None)],
+    'CPU_FREQ':     [(('cpu',), 'Clock', ['Cores (Average)', 'Cores (Average Effective)', 'Core #1',
+                                           'CPU Core #1'], None)],
+    'CPU_POWER':    [(('cpu',), 'Power', ['Package', 'CPU Package'], None)],
+    'CPU_VOLTAGE':  [(('cpu',), 'Voltage', ['Core (SVI2 TFN)', 'CPU Core', 'Core VID', 'CPU Cores'], None),
+                     (('mb',),  'Voltage', ['Vcore', 'CPU Core', 'CPU Vcore'], None)],
+    'GPU_USAGE':    [(('gpu', 'igpu'), 'Load', ['GPU Core', 'D3D 3D'], None)],
+    'GPU_TEMP':     [(('gpu', 'igpu'), 'Temperature', ['GPU Core', 'GPU Temperature'], None)],
+    'GPU_FAN1':     [(('gpu',), 'Fan', ['GPU Fan 1', 'GPU Fan', 'GPU'], None)],
+    'GPU_FAN2':     [(('gpu',), 'Fan', ['GPU Fan 2'], None)],
+    'GPU_FREQ':     [(('gpu', 'igpu'), 'Clock', ['GPU Core'], None)],
+    # 'GPU Package' is total board/ASIC power on both NVIDIA and AMD in LHM;
+    # AMD's separate GFX core rail ('GPU Core') is only a last resort since it
+    # excludes the SoC/memory rails and under-reports.
+    'GPU_POWER':    [(('gpu', 'igpu'), 'Power', ['GPU Package', 'GPU Total', 'GPU Power', 'GPU PPT',
+                                                 'GPU Core'], None)],
+    # D3D Dedicated is what Windows Task Manager shows and is accurate on AMD;
+    # 'GPU Memory Used' (driver-reported) is the fallback.
+    'VRAM_USED':    [(('gpu',), 'Data', ['D3D Dedicated Memory Used', 'GPU Memory Used'], 'GB'),
+                     (('gpu',), 'SmallData', ['D3D Dedicated Memory Used', 'GPU Memory Used'], 'GB')],
+    'RAM_USAGE':    [(('ram',), 'Load', ['Memory', 'Physical Memory'], None)],
+    'RAM_USED_GB':  [(('ram',), 'Data', ['Memory Used', 'Physical Memory Used', 'Used Memory'], 'GB')],
+    'RAM_FREE_GB':  [(('ram',), 'Data', ['Memory Available', 'Physical Memory Available',
+                                         'Available Memory'], 'GB')],
+    'DISK_TEMP':    [(('storage',), 'Temperature', ['Temperature', 'Composite Temperature',
+                                                    'Temperature 1'], None)],
+    'DISK_READ':    [(('storage',), 'Throughput', ['Read Rate'], 'MB/s')],
+    'DISK_WRITE':   [(('storage',), 'Throughput', ['Write Rate'], 'MB/s')],
+    'MB_TEMP':      [(('mb',), 'Temperature', ['Motherboard', 'System', 'PCH', 'Mainboard'], None)],
+    'CHASSIS_FAN1': [(('mb',), 'Fan', ['System Fan #1', 'Chassis Fan #1', 'Chassis Fan 1',
+                                       'System Fan', 'Chassis Fan', 'Fan #2'], None)],
+    'CHASSIS_FAN2': [(('mb',), 'Fan', ['System Fan #2', 'Chassis Fan #2', 'Chassis Fan 2', 'Fan #3'], None)],
+    'CHASSIS_FAN3': [(('mb',), 'Fan', ['System Fan #3', 'Chassis Fan #3', 'Chassis Fan 3', 'Fan #4'], None)],
+    'BATTERY':      [(('battery',), 'Level', ['Charge Level'], None)],
+    # NET_DOWN / NET_UP: handled specially in lhm_read_values() -- the busiest
+    # network adapter wins, so the active NIC is shown regardless of LHM's order.
+    # DISK_USAGE / DISK_USED / DISK_FREE: taken from the Windows system drive
+    # directly (shutil.disk_usage) -- LHM reports per physical disk, not per volume.
+    # NET_PING / FRAMERATE: not provided by LHM. Use RTSS for framerate.
+}
+
+def _lhm_convert(value, unit):
+    if value is None:
+        return None
+    if unit == 'GB':
+        return value / _GB
+    if unit == 'MB/s':
+        return value / _MB
+    return value
+
+def _lhm_custom_value(s):
+    """Display-unit value for a sensor picked directly in the Theme Builder
+    (CUSTOM_* keys): data sizes in GB, throughput in MB/s, the rest as-is."""
+    if s['type'] in ('Data', 'SmallData'):
+        return _lhm_convert(s['value'], 'GB')
+    if s['type'] == 'Throughput':
+        return _lhm_convert(s['value'], 'MB/s')
+    return s['value']
+
+def _lhm_custom_unit(s):
+    return {
+        'Temperature': '°C', 'Load': '%', 'Control': '%', 'Level': '%', 'Humidity': '%',
+        'Clock': 'MHz', 'Power': 'W', 'Voltage': 'V', 'Current': 'A', 'Fan': 'RPM',
+        'Data': 'GB', 'SmallData': 'GB', 'Throughput': 'MB/s', 'Frequency': 'Hz',
+        'Flow': 'L/h', 'Energy': 'mWh', 'Noise': 'dBA', 'Timing': 'ns',
+    }.get(s['type'], '')
+
+def lhm_resolve_standard(sensors):
+    """Map every standard key to the LHM sensor that supplies it.
+    Returns {key: sensor_dict}."""
+    # (category, type, name) -> [sensors in LHM tree order]
+    index = {}
+    for s in sensors:
+        if s['value'] is None:
+            continue
+        index.setdefault((s['category'], s['type'], s['name']), []).append(s)
+    resolved = {}
+    for key, rules in STANDARD_SENSOR_RULES.items():
+        found = None
+        for cats, stype, names, unit in rules:
+            for name in names:
+                for cat in cats:
+                    hits = index.get((cat, stype, name))
+                    if hits:
+                        found = (hits[0], unit)
+                        break
+                if found: break
+            if found: break
+        if found:
+            resolved[key] = found
+    return resolved
+
+def lhm_read_values(custom_map=None):
+    """Read all standard sensor keys (plus any CUSTOM_* keys from the
+    current theme) from LibreHardwareMonitor. Returns {} if LHM isn't
+    reachable -- missing keys just mean 'sensor unavailable'."""
+    data = {}
+    sensors = lhm_fetch()
+    if sensors is None:
+        return data
+    try:
+        for key, (s, unit) in lhm_resolve_standard(sensors).items():
+            v = _lhm_convert(s['value'], unit)
+            if v is not None:
+                data[key] = v
+
+        # RAM total = used + available (LHM has no separate 'total' sensor)
+        if 'RAM_USED_GB' in data and 'RAM_FREE_GB' in data:
+            data['RAM_TOTAL'] = data['RAM_USED_GB'] + data['RAM_FREE_GB']
+
+        # VRAM percentage = used / total, using LHM's own total for the same GPU
+        if 'VRAM_USED' in data:
+            total = None
+            used_hw = None
+            for s in sensors:
+                if s['category'] == 'gpu' and s['name'] in ('D3D Dedicated Memory Used', 'GPU Memory Used') \
+                        and s['value'] is not None:
+                    used_hw = s['hw_id']; break
+            for want in ('GPU Memory Total', 'D3D Dedicated Memory Total'):
+                for s in sensors:
+                    if s['category'] == 'gpu' and s['name'] == want and s['value'] and \
+                            (used_hw is None or s['hw_id'] == used_hw):
+                        total = s['value'] / _GB; break
+                if total: break
+            if not total:
+                total = _detected_vram_gb   # fallback: known-card lookup table
+            if total:
+                data['VRAM_USAGE'] = max(0.0, min(100.0, data['VRAM_USED'] / total * 100.0))
+
+        # Network: use whichever adapter is busiest right now
+        for key, name in (('NET_DOWN', 'Download Speed'), ('NET_UP', 'Upload Speed')):
+            vals = [s['value'] for s in sensors
+                    if s['category'] == 'nic' and s['type'] == 'Throughput'
+                    and s['name'] == name and s['value'] is not None]
+            if vals:
+                data[key] = max(vals) / _MB
+
+        # CUSTOM_* keys store LHM's stable SensorId string (e.g.
+        # "/amdcpu/0/temperature/2"), so they survive restarts and reordering.
+        if custom_map:
+            by_id = {s['id']: s for s in sensors}
+            for skey, sid in custom_map.items():
+                if not isinstance(sid, str):
+                    continue   # numeric index from an old HWiNFO-era theme -- see read_sensors()
+                s = by_id.get(sid)
+                if s is not None:
+                    v = _lhm_custom_value(s)
+                    if v is not None:
+                        data[skey] = v
     except Exception as e:
-        log.error(f'Shared memory read error: {e}')
-        # Any unexpected failure also resets the handle, rather than
-        # leaving a possibly-broken mapping in place indefinitely.
-        _shm_handle = None
+        log.error(f'LibreHardwareMonitor read error: {e}')
     return data
 
 
-# ── GPU VRAM capacity lookup ───────────────────────────────────────────────────
-# HWiNFO does not expose total VRAM capacity as a polled sensor (it's static
-# hardware info, not something that changes frame to frame) -- there's no
-# sensor name for it on either NVIDIA or AMD cards in anything we've found.
-# Since VRAM_USAGE (a 0-100% sensor) needs a total to divide VRAM_USED by,
-# we keep a small lookup table of known card model -> VRAM capacity (GB) and
-# match it against the GPU's device name string from HWiNFO's sensor groups
-# (e.g. "dGPU [#0]: AMD Radeon RX 9070 XT: PowerColor Radeon RX 9070 XT").
-# This only needs to run once at startup, not on every read, since a card's
-# VRAM capacity never changes while the system is running.
-#
-# Keys are matched as case-insensitive substrings against the device name,
-# longest/most-specific match wins (so "RX 9070 XT" doesn't accidentally
-# match against a plain "RX 9070" entry or vice versa).
+# ── GPU VRAM capacity lookup (fallback) ───────────────────────────────────────
+# LibreHardwareMonitor normally reports 'GPU Memory Total' alongside
+# 'GPU Memory Used', and VRAM_USAGE is computed from those two directly. This
+# table of known card model -> VRAM capacity (GB) is only a fallback for GPUs
+# where LHM doesn't expose a total. Keys are matched as case-insensitive
+# substrings against LHM's GPU name; the longest match wins (so "RX 9070 XT"
+# doesn't accidentally match a plain "RX 9070" entry).
 GPU_VRAM_GB = {
     # AMD RDNA4 / RDNA3
     'RX 9070 XT':  16,
@@ -407,136 +553,132 @@ GPU_VRAM_GB = {
 _detected_vram_gb = None  # cached once at startup; None means "not yet checked" or "no match found"
 
 def detect_gpu_vram_capacity():
-    """Match the GPU's device name (from discovered sensor groups) against
-    GPU_VRAM_GB to find its known total VRAM capacity. Called once at
-    startup -- result is cached in _detected_vram_gb for the rest of the
-    session, since a card's VRAM capacity is static hardware info that
-    will never change while the app is running."""
+    """Fallback only: LibreHardwareMonitor normally reports 'GPU Memory Total'
+    directly, so VRAM_USAGE is computed from that. If it doesn't for this GPU,
+    match the GPU's name (from LHM's hardware list) against GPU_VRAM_GB.
+    Called once at startup and on manual sensor re-discovery."""
     global _detected_vram_gb
-    sensors_path = os.path.join(CONFIG_DIR, 'hwinfo_sensors.json')
-    if not os.path.exists(sensors_path):
+    sensors = lhm_fetch(force=True)
+    if not sensors:
         return None
     try:
-        with open(sensors_path, encoding='utf-8') as f:
-            disc = json.load(f)
-        device_names = disc.get('device_names', [])
-        gpu_name = None
-        for d in device_names:
-            name = d.get('name', '')
-            if 'gpu' in name.lower():
-                gpu_name = name
-                break
+        gpu_name = next((s['hardware'] for s in sensors if s['category'] == 'gpu' and s['hardware']), None)
         if not gpu_name:
-            log.debug('VRAM capacity lookup: no GPU device name found in discovered sensors')
+            log.debug('VRAM capacity lookup: no discrete GPU found in LibreHardwareMonitor')
             return None
-
-        # Find the longest matching key (most specific match wins, so
-        # "RX 9070 XT" is preferred over a hypothetical shorter "RX 9070"
-        # match against the same name)
-        best_match = None
-        best_len = 0
+        # Longest matching key wins, so "RX 9070 XT" beats "RX 9070"
+        best_match, best_len = None, 0
         upper_name = gpu_name.upper()
         for key, gb in GPU_VRAM_GB.items():
             if key.upper() in upper_name and len(key) > best_len:
-                best_match = key
-                best_len = len(key)
+                best_match, best_len = key, len(key)
                 _detected_vram_gb = gb
-
         if best_match:
-            log.info(f'VRAM capacity detected: "{gpu_name}" matched "{best_match}" -> {_detected_vram_gb} GB')
+            log.info(f'VRAM capacity (fallback table): "{gpu_name}" matched "{best_match}" -> {_detected_vram_gb} GB')
         else:
-            log.info(f'VRAM capacity lookup: GPU "{gpu_name}" not found in known card database -- '
-                      f'VRAM_USAGE percentage will be unavailable (VRAM_USED in GB still works normally)')
+            log.debug(f'VRAM capacity fallback table has no entry for "{gpu_name}" '
+                      f'(fine as long as LHM reports GPU Memory Total)')
         return _detected_vram_gb
     except Exception as e:
         log.warning(f'VRAM capacity lookup error: {e}')
         return None
 
 
+SENSORS_FILE = os.path.join(CONFIG_DIR, 'lhm_sensors.json')
+
 def discover_sensors():
-    """Scan all HWiNFO shared memory entries and save to hwinfo_sensors.json.
-    Also reads the sensor group (device name) section so device names like
-    'AMD Ryzen 5 5600X' and 'ASRock B550M Steel Legend' are available in
-    the theme builder's + Sensors picker as static label elements.
-    Called automatically on startup and available from tray menu."""
-    if not _shm_handle:
-        log.warning('Cannot discover sensors - shared memory not available')
+    """Save every LibreHardwareMonitor sensor to lhm_sensors.json for the
+    Theme Builder's + Sensors picker. Each sensor is identified by LHM's
+    stable SensorId (e.g. "/amdcpu/0/temperature/2"), which is what a theme
+    stores for CUSTOM_* keys -- so picks keep working after restarts,
+    driver updates and hardware being added/removed. Hardware names
+    (e.g. 'AMD Ryzen 7 7800X3D') are included as device_names so they can
+    be dropped onto a theme as static labels.
+    Called automatically on startup and available from the tray menu."""
+    sensors = lhm_fetch(force=True)
+    if not sensors:
+        log.warning('Cannot discover sensors - LibreHardwareMonitor not reachable')
         return False
     try:
-        import ctypes
-        kernel32, win_handle, ptr, SM_SIZE, off_e, sz_e, n_e = _shm_handle
-        ptr = int(ptr)
+        # One device entry per hardware item, in LHM's tree order
+        device_names, hw_index = [], {}
+        for s in sensors:
+            if s['hw_id'] not in hw_index:
+                hw_index[s['hw_id']] = len(device_names)
+                device_names.append({'index': len(device_names), 'name': s['hardware'] or s['hw_id'],
+                                     'id': s['hw_id'], 'category': s['category']})
 
-        TYPE_NAMES = {0:'Other',1:'Temperature',2:'Voltage',3:'Fan',
-                      4:'Current',5:'Power',6:'Clock',7:'Usage',8:'Other'}
-
-        # Header layout (_HWiNFO_SENSORS_SHARED_MEM2):
-        # dwSignature(4) dwVersion(4) dwRevision(4) poll_time(8=long) = 20 bytes
-        # dwOffsetOfSensorSection(4)@0x14, dwSizeOfSensorElement(4)@0x18, dwNumSensorElements(4)@0x1C
-        # dwOffsetOfReadingSection(4)@0x20, dwSizeOfReadingElement(4)@0x24, dwNumReadingElements(4)@0x28
-        hdr = ctypes.string_at(ptr, 48)
-        off_s = struct.unpack_from('<I', hdr, 0x14)[0]  # sensor (device group) section
-        sz_s  = struct.unpack_from('<I', hdr, 0x18)[0]
-        n_s   = struct.unpack_from('<I', hdr, 0x1C)[0]
-
-        # Read device group names from the sensor section
-        # _HWiNFO_SENSORS_SENSOR_ELEMENT: dwSensorID(4) dwSensorInst(4) szSensorNameOrig(128) szSensorNameUser(128)
-        device_names = []
-        for i in range(n_s):
-            entry = ctypes.string_at(ptr + off_s + i * sz_s, min(sz_s, 264))
-            name = entry[8:8+128].rstrip(b'\x00').decode('ascii','replace').strip()
-            if name:
-                device_names.append({'index': i, 'name': name})
-
-        # dwSensorIndex linking each reading to its device group is at offset 0x04
-        sensors = []
-        for i in range(n_e):
-            entry = ctypes.string_at(ptr + off_e + i * sz_e, sz_e)
-            stype        = struct.unpack_from('<I', entry, 0x00)[0]
-            sensor_idx   = struct.unpack_from('<I', entry, 0x04)[0]
-            name_orig    = entry[0x0C:0x0C+128].rstrip(b'\x00').decode('ascii','replace').strip()
-            unit         = entry[0x10C:0x10C+16].rstrip(b'\x00').decode('ascii','replace').strip()
-            val          = struct.unpack_from('<d', entry, 0x11C)[0]
-            if not name_orig: continue
-            sensors.append({
+        std_for = {s['id']: key for key, (s, _u) in lhm_resolve_standard(sensors).items()}
+        cat_names = {'cpu': 'cpu', 'gpu': 'gpu', 'igpu': 'gpu', 'ram': 'ram', 'vram': 'ram',
+                     'mb': 'motherboard', 'storage': 'storage', 'nic': 'network',
+                     'battery': 'system', 'psu': 'system'}
+        out_sensors = []
+        for i, s in enumerate(sensors):
+            if s['type'] in ('TimeSpan',):   # not a numeric value the panel can render
+                continue
+            v = _lhm_custom_value(s)
+            entry = {
                 'index':        i,
-                'sensor_index': sensor_idx,
-                'type':         TYPE_NAMES.get(stype, 'Other'),
-                'name':         name_orig,
-                'unit':         unit,
-                'sample':       round(val, 3),
-            })
+                'id':           s['id'],
+                'sensor_index': hw_index[s['hw_id']],
+                'device':       s['hardware'],
+                'category':     cat_names.get(s['category'], 'system'),
+                'type':         s['type'],
+                'name':         s['name'],
+                'unit':         _lhm_custom_unit(s),
+                'sample':       round(v, 3) if isinstance(v, (int, float)) else 0,
+            }
+            if s['id'] in std_for:
+                entry['std_key'] = std_for[s['id']]
+            out_sensors.append(entry)
 
-        out = {'generated': str(datetime.now()), 'device_names': device_names, 'sensors': sensors}
-        sensors_path = os.path.join(CONFIG_DIR, 'hwinfo_sensors.json')
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(sensors_path, 'w', encoding='utf-8') as f:
-            json.dump(out, f, indent=2)
-        log.info(f'Sensor discovery: {len(sensors)} sensors, {len(device_names)} device groups saved to {sensors_path}')
-        return sensors_path
+        out = {'generated': str(datetime.now()), 'source': 'LibreHardwareMonitor',
+               'lhm_version': _lhm_version, 'device_names': device_names, 'sensors': out_sensors}
+        with open(SENSORS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
+        log.info(f'Sensor discovery: {len(out_sensors)} sensors, {len(device_names)} devices saved to {SENSORS_FILE}')
+        return SENSORS_FILE
     except Exception as e:
         log.error(f'Sensor discovery error: {e}')
         return False
 
+_legacy_custom_warned = set()
+
 def read_sensors():
-    """Read all sensor values from HWiNFO64's shared memory. Returns an
-    empty dict if HWiNFO64 isn't running or shared memory isn't enabled —
-    callers should treat missing keys as 'sensor unavailable', not an error."""
-    # CUSTOM_N entries (manually wired sensors HWiNFO doesn't have a
-    # standard name for) come from the currently loaded THEME's own
-    # sensorMap, not a persisted global config -- standard keys resolve
-    # by name fresh on every read inside read_sharedmem() itself and need
-    # no map passed in at all.
+    """Read all sensor values from LibreHardwareMonitor. Returns an empty
+    dict if LHM isn't running / its web server isn't enabled -- callers
+    treat missing keys as 'sensor unavailable', not an error."""
+    # CUSTOM_* entries (sensors picked directly in the Theme Builder) come
+    # from the currently loaded THEME's own sensorMap; standard keys are
+    # resolved by name on every read and need no map at all.
     custom_map = {}
     if _current_theme:
         for k, v in _current_theme.get('sensorMap', {}).items():
-            if k.startswith('CUSTOM_') and v is not None:
+            if not k.startswith('CUSTOM_') or v is None:
+                continue
+            if isinstance(v, str):
                 custom_map[k] = v
-    if _shm_handle is None:
-        try_open_sharedmem()
-    d = read_sharedmem(custom_map) if _shm_handle is not None else {}
+            elif k not in _legacy_custom_warned:
+                # Numeric index = picked from the old HWiNFO sensor list. There's
+                # no way to translate an HWiNFO index to an LHM sensor, so it
+                # needs re-picking in the Theme Builder.
+                _legacy_custom_warned.add(k)
+                log.warning(f'Theme sensor {k} uses an old HWiNFO index ({v}) - re-pick it in the '
+                            f'Theme Builder from the LibreHardwareMonitor sensor list')
+    d = lhm_read_values(custom_map)
 
-    # RTSS is optional and independent of HWiNFO — merge in FPS values if available
+    # Disk space for the Windows system drive (LHM reports physical disks,
+    # not volumes, so this is read straight from Windows)
+    try:
+        import shutil
+        du = shutil.disk_usage(os.environ.get('SystemDrive', 'C:') + '\\')
+        d['DISK_USED']  = du.used / _GB
+        d['DISK_FREE']  = du.free / _GB
+        d['DISK_USAGE'] = du.used / du.total * 100.0 if du.total else 0.0
+    except Exception:
+        pass
+
+    # RTSS is optional and independent of LHM -- merge in FPS values if available
     rtss_vals = read_rtss_framerate()
     if rtss_vals is not None:
         d.update(rtss_vals)
@@ -544,9 +686,9 @@ def read_sensors():
     return d
 
 # ── RTSS Reader (optional — FPS via RivaTuner Statistics Server) ──────────────
-# Independent of HWiNFO. RTSS hooks directly into the game's D3D/OpenGL/Vulkan
+# Independent of LibreHardwareMonitor. RTSS hooks directly into the game's D3D/OpenGL/Vulkan
 # present calls, so its per-process framerate is attributed correctly without
-# needing HWiNFO Pro to exclude background applications.
+# needing any other monitoring tool to filter out background applications.
 _rtss_handle = None       # (kernel32, win_handle, ptr, size) once mapped
 _rtss_unavailable_logged = False
 _rtss_last_attempt = 0     # time.time() of the last connection attempt
@@ -554,7 +696,7 @@ _rtss_retry_interval = 10  # seconds between reconnect attempts while unavailabl
 
 def try_open_rtss():
     """Try to open RTSS shared memory using the same pure-ctypes approach
-    that works for HWiNFO. Safe to call repeatedly — RTSS may not be
+    used for other Windows shared-memory sources. Safe to call repeatedly — RTSS may not be
     running, may be started later, or may be closed; we just keep retrying
     on each read rather than treating one failure as permanent."""
     global _rtss_handle, _rtss_unavailable_logged
@@ -1339,7 +1481,7 @@ def load_theme(path):
             return False
 
         # Standard sensor keys (CPU_USAGE, GPU_TEMP, etc.) need no mapping
-        # step at all -- read_sharedmem() resolves them fresh by NAME on
+        # step at all -- lhm_read_values() resolves them fresh by NAME on
         # every single read. Any CUSTOM_N entries in this theme's own
         # sensorMap are read directly from _current_theme by read_sensors()
         # when needed, with nothing copied into the global config.
@@ -1407,7 +1549,6 @@ def stream_loop():
         try:
             if _current_theme is None:
                 time.sleep(0.5); continue
-            check_hwinfo_restart_needed()  # internally gated to ~every 30 min, cheap no-op otherwise
             sensors = read_sensors()
             img     = render_frame(_current_theme, sensors)
             buf = io.BytesIO()
@@ -1442,135 +1583,6 @@ def stop_display():
     if _port and _port.is_open: _port.close()
     update_tray_icon()
     log.info('Display stopped')
-
-# ── HWiNFO Auto-Restart (replaces the old Scheduled Task approach) ────────────
-def get_hwinfo_start_time():
-    """Return the datetime HWiNFO64.exe actually started, or None if it
-    isn't currently running / detection fails. Used both to decide whether
-    a restart is due, and purely informationally in Settings/Status."""
-    try:
-        import ctypes
-        from ctypes import wintypes
-        from datetime import timedelta
-        psapi = ctypes.windll.psapi
-        kernel32 = ctypes.windll.kernel32
-        pids = (wintypes.DWORD * 1024)()
-        cb_needed = wintypes.DWORD()
-        psapi.EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(cb_needed))
-        count = cb_needed.value // ctypes.sizeof(wintypes.DWORD)
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        PROCESS_QUERY_INFORMATION = 0x0400
-        PROCESS_VM_READ = 0x0010
-        log.debug(f'get_hwinfo_start_time: enumerated {count} processes')
-        found_hwinfo = False
-        for i in range(count):
-            pid = pids[i]
-            if not pid: continue
-            hproc = None
-            for access in (PROCESS_QUERY_LIMITED_INFORMATION,
-                           PROCESS_QUERY_INFORMATION,
-                           PROCESS_QUERY_INFORMATION | PROCESS_VM_READ):
-                hproc = kernel32.OpenProcess(access, False, pid)
-                if hproc: break
-            if not hproc:
-                continue
-            try:
-                name_buf = ctypes.create_unicode_buffer(260)
-                size = wintypes.DWORD(260)
-                got_name = False
-                if psapi.GetModuleBaseNameW(hproc, None, name_buf, size):
-                    got_name = True
-                else:
-                    path_buf = ctypes.create_unicode_buffer(1024)
-                    path_size = wintypes.DWORD(1024)
-                    if kernel32.QueryFullProcessImageNameW(hproc, 0, path_buf, ctypes.byref(path_size)):
-                        import os as _os
-                        name_buf.value = _os.path.basename(path_buf.value)
-                        got_name = True
-                if got_name:
-                    name_lower = name_buf.value.lower()
-                    log.debug(f'  PID {pid}: {name_buf.value} (lower={name_lower})')
-                    if name_lower == 'hwinfo64.exe':
-                        found_hwinfo = True
-                        creation = wintypes.FILETIME()
-                        exit_t = wintypes.FILETIME()
-                        kernel_t = wintypes.FILETIME()
-                        user_t = wintypes.FILETIME()
-                        if kernel32.GetProcessTimes(hproc, ctypes.byref(creation),
-                                ctypes.byref(exit_t), ctypes.byref(kernel_t), ctypes.byref(user_t)):
-                            ft = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
-                            log.info(f'Found HWiNFO64.exe at PID {pid}, start time resolved')
-                            return datetime(1601,1,1) + timedelta(microseconds=ft/10)
-                        else:
-                            log.warning(f'  PID {pid}: GetProcessTimes failed (err={kernel32.GetLastError()})')
-            finally:
-                kernel32.CloseHandle(hproc)
-        if not found_hwinfo:
-            log.debug('get_hwinfo_start_time: HWiNFO64.exe not found in process list')
-    except Exception as e:
-        log.warning(f'Could not detect HWiNFO64 start time: {e}')
-    return None
-
-
-_last_hwinfo_restart_check = 0
-HWINFO_RESTART_CHECK_INTERVAL = 30 * 60   # check every 30 minutes
-HWINFO_RESTART_THRESHOLD     = 11.5 * 3600  # restart once HWiNFO64 has run this long (seconds)
-
-def check_hwinfo_restart_needed():
-    """Called periodically from the main loop (every ~30 min, gated by
-    HWINFO_RESTART_CHECK_INTERVAL). If HWiNFO64 has been running for
-    11.5+ hours and the auto-restart setting is enabled, stop and restart
-    it -- a normal user-level action requiring no elevation/UAC prompt,
-    since we're just killing and relaunching an ordinary application we
-    already have permission to interact with (unlike registering a
-    Windows Scheduled Task, which DOES require elevation).
-
-    This replaces the old Scheduled-Task-based approach entirely. A fixed
-    schedule had no way to know about real-world power cycles -- if the
-    PC was shut down and restarted, the task's fixed timing could drift
-    hours out of sync with HWiNFO64's actual uptime. Checking live, on a
-    timer, against HWiNFO64's real current uptime has no such drift,
-    because there's no schedule to drift from in the first place.
-    """
-    global _last_hwinfo_restart_check
-    if not cfg.get('hwinfo_auto_restart', False):
-        return
-    now = time.time()
-    if now - _last_hwinfo_restart_check < HWINFO_RESTART_CHECK_INTERVAL:
-        return
-    _last_hwinfo_restart_check = now
-
-    start = get_hwinfo_start_time()
-    if start is None:
-        log.debug('HWiNFO restart check: HWiNFO64 not currently running, nothing to do')
-        return
-
-    uptime_seconds = (datetime.utcnow() - start).total_seconds()
-    log.debug(f'HWiNFO restart check: HWiNFO64 uptime is {uptime_seconds/3600:.2f}h')
-    if uptime_seconds < HWINFO_RESTART_THRESHOLD:
-        return
-
-    path = cfg.get('hwinfo_path', '').strip()
-    if not path or not os.path.exists(path):
-        log.warning('HWiNFO64 is due for a restart (12h limit approaching) but no HWiNFO64.exe '
-                    'path is configured in Settings -> HWiNFO -- cannot restart automatically. '
-                    'Set the path in Settings to enable this.')
-        return
-
-    log.info(f'HWiNFO64 has been running {uptime_seconds/3600:.2f}h - restarting now to keep '
-             f'shared memory active before the free-version 12h limit')
-    try:
-        import subprocess
-        subprocess.run(['taskkill', '/IM', 'HWiNFO64.exe', '/F'],
-                       capture_output=True, timeout=10)
-        time.sleep(2)
-        args = [path]
-        if cfg.get('hwinfo_pro', False):
-            args.append('-sensors')
-        subprocess.Popen(args)
-        log.info('HWiNFO64 restarted successfully')
-    except Exception as e:
-        log.error(f'HWiNFO64 restart failed: {e}')
 
 # ── Settings Window ───────────────────────────────────────────────────────────
 _settings_win = None
@@ -1671,87 +1683,66 @@ def open_settings():
     ttk.Button(t1, text='📁 Open Log Folder', command=open_log_folder).grid(
         row=7, column=0, columnspan=2, sticky='w', padx=8, pady=(6,4))
 
-    # ── Tab 2: HWiNFO ────────────────────────────────────────────────────────
-    t3 = ttk.Frame(nb); nb.add(t3, text='  HWiNFO  ')
+    # ── Tab 2: LibreHardwareMonitor ──────────────────────────────────────────
+    t3 = ttk.Frame(nb); nb.add(t3, text='  LibreHardwareMonitor  ')
 
-    ttk.Label(t3, text='HWiNFO64 Shared Memory — 12-Hour Limit Workaround',
+    ttk.Label(t3, text='Sensor Source — LibreHardwareMonitor',
               font=('Segoe UI', 10, 'bold'), foreground='#00b4ff').pack(
         anchor='w', padx=10, pady=(12,4))
 
     msg = (
-        'HWiNFO64 free edition disables shared memory after 12 hours.\n'
-        'This app can automatically detect HWiNFO64\'s real uptime\n'
-        'every 30 minutes and restart it once it has been running\n'
-        'for 11.5 hours, keeping shared memory active indefinitely.\n\n'
-        'This runs silently in the background — no window appears,\n'
-        'and it requires no extra permissions, since restarting an\n'
-        'ordinary application you already have access to is not an\n'
-        'elevated action (unlike registering a Windows Scheduled Task,\n'
-        'which is why earlier versions needed a UAC prompt for this).'
+        'All hardware sensors are read from LibreHardwareMonitor (LHM) through its\n'
+        'built-in web server. One-time setup in LHM:\n'
+        '  1. Run LibreHardwareMonitor as administrator\n'
+        '  2. Options → Remote Web Server → Run   (default port 8085)\n'
+        '  3. Optional: Options → Run On Windows Startup, Start Minimized,\n'
+        '     Minimize To Tray — so it\'s always there in the background\n\n'
+        'There is no time limit and nothing to restart — LHM can run indefinitely.'
     )
     ttk.Label(t3, text=msg, font=('Segoe UI', 9), foreground='#aaa',
-              justify='left', wraplength=460).pack(anchor='w', padx=10, pady=4)
+              justify='left', wraplength=500).pack(anchor='w', padx=10, pady=4)
 
-    # Detect HWiNFO64 exe path
-    hwinfo_path_var = tk.StringVar(value=cfg.get('hwinfo_path', ''))
-    def detect_hwinfo():
-        import glob
-        candidates = [
-            r'C:\Program Files\HWiNFO64\HWiNFO64.exe',
-            r'C:\Program Files (x86)\HWiNFO64\HWiNFO64.exe',
-        ] + glob.glob(r'C:\Users\*\AppData\Local\HWiNFO64\HWiNFO64.exe')
-        for p in candidates:
-            if os.path.exists(p):
-                hwinfo_path_var.set(p)
-                return
-        messagebox.showinfo('DS916', 'HWiNFO64 not found in common locations.\nBrowse to locate it manually.', parent=win)
+    lhm_frame = ttk.Frame(t3); lhm_frame.pack(fill='x', padx=10, pady=6)
+    lhm_host_var = tk.StringVar(value=str(cfg.get('lhm_host', '127.0.0.1')))
+    lhm_port_var = tk.StringVar(value=str(cfg.get('lhm_port', 8085)))
+    ttk.Label(lhm_frame, text='Host:').grid(row=0, column=0, sticky='w', pady=2)
+    ttk.Entry(lhm_frame, textvariable=lhm_host_var, width=18).grid(row=0, column=1, padx=6, pady=2, sticky='w')
+    ttk.Label(lhm_frame, text='Port:').grid(row=0, column=2, sticky='w', pady=2)
+    ttk.Entry(lhm_frame, textvariable=lhm_port_var, width=7).grid(row=0, column=3, padx=6, pady=2, sticky='w')
+    ttk.Label(t3, text='Leave as 127.0.0.1 : 8085 unless you changed the port in LHM.',
+              font=('Segoe UI', 8), foreground='#888').pack(anchor='w', padx=10, pady=(0,4))
 
-    def browse_hwinfo():
-        p = filedialog.askopenfilename(
-            parent=win, title='Locate HWiNFO64.exe',
-            filetypes=[('HWiNFO64', 'HWiNFO64.exe'), ('Executable', '*.exe')])
-        if p: hwinfo_path_var.set(p)
-
-    hw_frame = ttk.Frame(t3); hw_frame.pack(fill='x', padx=10, pady=4)
-    ttk.Label(hw_frame, text='HWiNFO64.exe:').grid(row=0, column=0, sticky='w', pady=2)
-    ttk.Entry(hw_frame, textvariable=hwinfo_path_var, width=36).grid(row=0, column=1, padx=6, pady=2)
-    ttk.Button(hw_frame, text='Detect', command=detect_hwinfo).grid(row=0, column=2, padx=2)
-    ttk.Button(hw_frame, text='Browse…', command=browse_hwinfo).grid(row=0, column=3, padx=2)
-
-    auto_restart_var = tk.BooleanVar(value=cfg.get('hwinfo_auto_restart', False))
-    ttk.Checkbutton(t3, text='Automatically restart HWiNFO64 before the 12-hour limit (off by default)',
-                    variable=auto_restart_var).pack(anchor='w', padx=10, pady=(10,4))
-    ttk.Label(t3, text="Leave this off if you have HWiNFO Pro (no 12-hour limit) or prefer to\n"
-                       "restart HWiNFO64 yourself. When on, this restarts HWiNFO64 without\n"
-                       "asking each time — only enable it if you're comfortable with that.",
-              font=('Segoe UI', 8), foreground='#888', justify='left').pack(anchor='w', padx=10, pady=(0,4))
-
-    hwinfo_pro_var = tk.BooleanVar(value=cfg.get('hwinfo_pro', False))
-    ttk.Checkbutton(t3, text='I have HWiNFO64 Pro (enable -sensors flag on auto-restart)',
-                    variable=hwinfo_pro_var).pack(anchor='w', padx=10, pady=(6,4))
-    ttk.Label(t3, text="Only check this if you own a Pro license. The free version will show\n"
-                       "an error dialog if launched with command-line parameters.",
-              font=('Segoe UI', 8), foreground='#888', justify='left').pack(anchor='w', padx=10, pady=(0,4))
-
-    hwinfo_status_lbl = ttk.Label(t3, text='', font=('Segoe UI', 9))
-    hwinfo_status_lbl.pack(anchor='w', padx=10, pady=(2,8))
-    def refresh_hwinfo_status():
-        start = get_hwinfo_start_time()
-        if start is None:
-            hwinfo_status_lbl.config(text='○ HWiNFO64 is not currently running', foreground='#888')
-            return
-        uptime_h = (datetime.now() - start).total_seconds() / 3600
-        next_restart_h = max(0, 11.5 - uptime_h)
-        hwinfo_status_lbl.config(
-            text=f'✅ HWiNFO64 running for {uptime_h:.1f}h — next auto-restart in ~{next_restart_h:.1f}h',
-            foreground='#4fc87a')
-    ttk.Button(t3, text='↻ Refresh Status', command=refresh_hwinfo_status).pack(anchor='w', padx=10)
-    refresh_hwinfo_status()
+    lhm_status_lbl = ttk.Label(t3, text='', font=('Segoe UI', 9), wraplength=500, justify='left')
+    lhm_status_lbl.pack(anchor='w', padx=10, pady=(6,8))
+    def test_lhm():
+        # Test with the values currently typed in, without saving them yet
+        old = (cfg.get('lhm_host'), cfg.get('lhm_port'))
+        cfg['lhm_host'] = lhm_host_var.get().strip() or '127.0.0.1'
+        try: cfg['lhm_port'] = int(lhm_port_var.get().strip() or 8085)
+        except ValueError: cfg['lhm_port'] = 8085
+        try:
+            sensors = lhm_fetch(force=True)
+        finally:
+            cfg['lhm_host'], cfg['lhm_port'] = old
+            lhm_fetch(force=True)   # reconnect with the saved values
+        if sensors:
+            found = sorted(lhm_resolve_standard(sensors).keys())
+            lhm_status_lbl.config(
+                text=f'✅ Connected — LHM {_lhm_version or ""}, {len(sensors)} sensors, '
+                     f'{len(found)} standard keys mapped',
+                foreground='#4fc87a')
+        else:
+            lhm_status_lbl.config(
+                text='○ Not reachable — is LibreHardwareMonitor running with\n'
+                     '   Options → Remote Web Server → Run enabled?',
+                foreground='#e05a4b')
+    ttk.Button(t3, text='↻ Test Connection', command=test_lhm).pack(anchor='w', padx=10)
+    test_lhm()
 
     # ── Tab: RTSS (optional FPS source) ──────────────────────────────────────
     t4 = ttk.Frame(nb); nb.add(t4, text='  RTSS (FPS)  ')
     ttk.Label(t4, text='RivaTuner Statistics Server (RTSS) is an optional, separate source for\n'
-                        'reliable per-game FPS — independent of HWiNFO. If RTSS isn\'t installed\n'
+                        'reliable per-game FPS — independent of LibreHardwareMonitor. If RTSS isn\'t installed\n'
                         'or running, the FPS sensor simply stays unavailable; everything else\n'
                         'keeps working normally.',
               font=('Segoe UI', 9), foreground='#888', justify='left').pack(anchor='w', padx=10, pady=(8,8))
@@ -1804,21 +1795,25 @@ def open_settings():
         cfg['theme_path']    = theme_var.get()
         cfg['autostart']     = auto_var.get()
         cfg['rtss_process']  = proc_var.get().strip() if rtss_mode_var.get()=='manual' else ''
-        cfg['hwinfo_path']   = hwinfo_path_var.get().strip()
-        cfg['hwinfo_auto_restart'] = auto_restart_var.get()
-        cfg['hwinfo_pro']    = hwinfo_pro_var.get()
+        cfg['lhm_host']      = lhm_host_var.get().strip() or '127.0.0.1'
+        try:
+            cfg['lhm_port']  = int(lhm_port_var.get().strip() or 8085)
+        except ValueError:
+            cfg['lhm_port']  = 8085
         cfg['log_level']     = log_level_var.get()
 
         # Log what actually changed, not just that Save was clicked -- useful
         # for understanding behavior changes later (e.g. "why did logging
         # stop" traces back to someone switching log_level to 'off' on a
         # specific date).
-        for key in ('com_port','fps','autostart','rtss_process','hwinfo_path',
-                    'hwinfo_auto_restart','hwinfo_pro','log_level'):
+        for key in ('com_port','fps','autostart','rtss_process','lhm_host',
+                    'lhm_port','log_level'):
             if old_cfg.get(key) != cfg.get(key):
                 log.info(f'Setting changed: {key} = {old_cfg.get(key)!r} -> {cfg.get(key)!r}')
 
         save_cfg(cfg)
+        if (old_cfg.get('lhm_host'), old_cfg.get('lhm_port')) != (cfg['lhm_host'], cfg['lhm_port']):
+            lhm_fetch(force=True)   # reconnect to the new address right away
         set_log_level(cfg['log_level'])
         set_autostart(cfg['autostart'])
         if cfg['theme_path'] and cfg['theme_path'] != _current_theme_path:
@@ -2110,31 +2105,17 @@ def _show_status_main():
     row(s1, 'Theme',        theme_name)
     row(s1, 'Resolution',   theme_res)
 
-    # HWiNFO
-    s2 = section('HWiNFO64 Sensor Source')
-    if _shm_handle is not None:
-        src_label = 'Shared Memory  ✅'
-        src_col   = GRN
+    # LibreHardwareMonitor
+    s2 = section('Sensor Source — LibreHardwareMonitor')
+    lhm_sensors = lhm_fetch(force=True)
+    if lhm_sensors:
+        row(s2, 'Source', f'Web server {_lhm_url().rsplit("/", 1)[0]}  ✅', GRN)
+        row(s2, 'Version', _lhm_version or 'unknown')
+        row(s2, 'Sensors', f'{len(lhm_sensors)} found, '
+                           f'{len(lhm_resolve_standard(lhm_sensors))} standard keys mapped')
     else:
-        src_label = 'Unavailable — HWiNFO64 not running or Shared Memory Support not enabled'
-        src_col   = '#d4b84a'
-    row(s2, 'Source',       src_label, src_col)
-
-    hwinfo_start = get_hwinfo_start_time()
-    if hwinfo_start:
-        uptime_h = (datetime.now() - hwinfo_start).total_seconds() / 3600
-        auto_on = cfg.get('hwinfo_auto_restart', False)
-        if auto_on:
-            next_restart_h = max(0, 11.5 - uptime_h)
-            restart_label = f'✅ Auto-restart on — next in ~{next_restart_h:.1f}h (uptime {uptime_h:.1f}h)'
-            restart_col = GRN
-        else:
-            restart_label = f'○ Auto-restart off (uptime {uptime_h:.1f}h)'
-            restart_col = MUT
-    else:
-        restart_label = '○ HWiNFO64 not running'
-        restart_col = MUT
-    row(s2, 'Auto-restart', restart_label, restart_col)
+        row(s2, 'Source', 'Unavailable — LibreHardwareMonitor not running or '
+                          'Remote Web Server not enabled', '#d4b84a')
 
     # Sensors
     s3 = section('Live Sensor Snapshot')
@@ -2198,14 +2179,15 @@ def _discover_sensors_main():
     if path:
         detect_gpu_vram_capacity()  # re-check in case the GPU changed since last discovery
         messagebox.showinfo('DS916 — Sensor Discovery',
-            f'✅ {len(json.load(open(path))["sensors"])} sensors discovered and saved.\n\n'
+            f'✅ {len(json.load(open(path, encoding="utf-8"))["sensors"])} sensors discovered and saved.\n\n'
             f'{path}\n\n'
             'Open the Theme Builder and click "Import Sensor List" to use them.',
             parent=_tk_root)
     else:
         messagebox.showwarning('DS916 — Sensor Discovery',
             'Could not discover sensors.\n'
-            'Make sure HWiNFO64 is running with Shared Memory enabled.',
+            'Make sure LibreHardwareMonitor is running (as administrator) with\n'
+            'Options → Remote Web Server → Run enabled.',
             parent=_tk_root)
 
 def build_menu():
@@ -2241,21 +2223,18 @@ if __name__ == '__main__':
     _tk_root.withdraw()          # keep it invisible
     _tk_root.after(100, _poll_ui_queue)   # start queue polling
 
-    # Try shared memory at startup. If it's not available yet (HWiNFO64 not
-    # running, or Shared Memory Support not enabled), don't treat this as
-    # fatal — read_sensors() retries on every sensor read, so it'll connect
-    # automatically as soon as HWiNFO64 becomes available.
-    if try_open_sharedmem():
-        log.info('HWiNFO source: Shared Memory connected')
+    # Try LibreHardwareMonitor at startup. If it isn't reachable yet (LHM
+    # not running, or its Remote Web Server not enabled), that's not fatal --
+    # read_sensors() keeps retrying in the background and connects
+    # automatically as soon as LHM becomes available.
+    if lhm_fetch(force=True):
         # Auto-discover and save sensors on every startup
         discover_sensors()
-        # Detect GPU VRAM capacity once at startup (static hardware info,
-        # never needs re-checking during the session) so VRAM_USAGE can be
-        # computed as a percentage even on cards that don't expose one directly
+        # VRAM total fallback lookup (only used if LHM has no GPU Memory Total)
         detect_gpu_vram_capacity()
     else:
-        log.info('HWiNFO source: unavailable for now - will keep retrying on each sensor read')
-        log.info('  (start HWiNFO64 with Settings -> General -> Shared Memory Support enabled)')
+        log.info('LibreHardwareMonitor: unavailable for now - will keep retrying on each sensor read')
+        log.info('  (run LHM as administrator with Options -> Remote Web Server -> Run enabled)')
 
     # Set autostart if configured
     if cfg.get('autostart', True):

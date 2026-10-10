@@ -6,6 +6,24 @@ Versions follow [Semantic Versioning](https://semver.org/) loosely: **MAJOR** fo
 
 ## [Unreleased]
 
+### Changed — Sensor source switched from HWiNFO64 to LibreHardwareMonitor
+- **All hardware sensors now come from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)** via its built-in Remote Web Server (`http://127.0.0.1:8085/data.json`) instead of HWiNFO64 shared memory. Only one monitoring app is needed; HWiNFO64 can be uninstalled. Pure stdlib (`urllib` + `json`) — no new Python dependencies.
+- Works with both current LHM builds (`RawValue`/`Type` fields, data sizes in bytes) and older releases (formatted values only, data sizes in GB/MB), including non-English decimal commas and the °F display setting.
+- Standard sensor keys are resolved by sensor name **and** hardware type (CPU / GPU / memory / motherboard / drive / network) on every read — see `STANDARD_SENSOR_RULES`. Discrete GPUs are preferred over integrated graphics; `NET_DOWN`/`NET_UP` follow the busiest network adapter.
+- `VRAM_USAGE` is now computed from LHM's own "GPU Memory Total" for the card; the `GPU_VRAM_GB` lookup table is kept only as a fallback.
+- `DISK_USAGE` / `DISK_USED` / `DISK_FREE` are read for the Windows system drive directly from Windows.
+- Sensor discovery now writes `%APPDATA%\DS916Tray\lhm_sensors.json`. Custom sensors picked in the Theme Builder are stored by LHM's stable sensor ID (e.g. `/amdcpu/0/temperature/2`) rather than a position index, so they survive restarts and hardware changes. Duplicate LHM names are disambiguated in the picker (e.g. `GPU Core Temp`, `Samsung SSD 990 PRO 2TB: Temperature`).
+- Settings → **HWiNFO** tab replaced by a **LibreHardwareMonitor** tab (host, port, setup steps, Test Connection). Status window shows LHM version and how many sensors/standard keys were found.
+- If LHM isn't reachable, the tray app logs one warning and retries every 5 seconds in the background without stalling the display.
+
+### Removed
+- HWiNFO64 shared-memory reader, the 12-hour-limit auto-restart (no longer needed — LHM has no time limit), and the `hwinfo_path` / `hwinfo_auto_restart` / `hwinfo_pro` settings (dropped from existing configs automatically).
+- Theme Builder's index-based **⚙ Sensor Map** dialog.
+- `NET_PING` and `FRAMERATE` no longer have a source (LHM has neither); use the RTSS keys for FPS.
+
+### Migration
+- Themes keep working for all standard keys. Elements bound to a custom sensor from the old `hwinfo_sensors.json` (`CUSTOM_<number>`) must be re-picked from `lhm_sensors.json` in the Theme Builder; the tray app logs a warning for each.
+
 ## [1.5.0] — Cross-Vendor GPU Support
 
 ### Added
