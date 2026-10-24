@@ -1,22 +1,36 @@
 @echo off
+setlocal
+cd /d "%~dp0"
 echo ========================================
-echo  DS916 Theme Builder - Build Script
+echo  DS916 Tray - Build Script (Rust)
 echo ========================================
 echo.
 
-:: Install dependencies
-echo [1/5] Installing Python dependencies...
-pip install pyinstaller pillow pyserial pystray --quiet
-if errorlevel 1 (echo ERROR: pip install failed && pause && exit /b 1)
-echo Done.
+:: 1. Toolchain check
+echo [1/5] Checking Rust toolchain...
+where cargo >nul 2>&1
+if errorlevel 1 (
+  echo ERROR: cargo was not found.
+  echo   Install Rust from https://rustup.rs ^(default options^), plus the
+  echo   "Desktop development with C++" workload from Visual Studio Build Tools,
+  echo   then open a NEW terminal and run build.bat again.
+  pause
+  exit /b 1
+)
+cargo --version
 echo.
 
 set "INSTALL_DIR=%APPDATA%\DS916Tray"
 
-:: Close any currently-running instance so the exe isn't locked when we try
-:: to overwrite it below -- avoids the old uninstall/rebuild/reinstall dance
-:: by letting this script handle the "close the old one" step itself.
+:: 2. Close any running instance so the exe isn't locked when we overwrite it
 echo [2/5] Closing any running DS916Tray instance...
+:: Preserve the boot task, but stop its Session 0 worker before replacing the exe.
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0enable-boot-start.ps1" -Action Stop
+if errorlevel 1 (
+  echo ERROR: Could not stop the DS916 boot task. Try an administrator terminal.
+  pause
+  exit /b 1
+)
 tasklist /FI "IMAGENAME eq DS916Tray.exe" 2>nul | find /I "DS916Tray.exe" >nul
 if not errorlevel 1 (
   taskkill /IM DS916Tray.exe /F >nul 2>&1
@@ -27,27 +41,26 @@ if not errorlevel 1 (
 )
 echo.
 
-:: Build exe
-echo [3/5] Building DS916Tray.exe...
-python -m PyInstaller --onefile --windowed --name=DS916Tray --hidden-import=pystray._win32 --hidden-import=PIL._tkinter_finder ds916_tray.py
-if errorlevel 1 (echo ERROR: PyInstaller failed && pause && exit /b 1)
+:: 3. Build
+echo [3/5] Building DS916Tray.exe (release)...
+cargo build --release
+if errorlevel 1 (echo ERROR: cargo build failed && pause && exit /b 1)
 echo Done.
 echo.
 
-:: Install into AppData -- keeps everything (exe, theme builder, config,
-:: themes, discovered sensors) together in one place for easy cleanup later,
-:: rather than scattering files across wherever the user happened to
-:: extract/build them
+:: 4. Install into AppData -- exe, theme builder, config, themes and discovered
+:: sensors all live together in one place
 echo [4/5] Installing to %%APPDATA%%\DS916Tray...
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
-copy /Y dist\DS916Tray.exe "%INSTALL_DIR%\DS916Tray.exe" >nul
+copy /Y "target\release\DS916Tray.exe" "%INSTALL_DIR%\DS916Tray.exe" >nul
+if errorlevel 1 (echo ERROR: could not copy DS916Tray.exe && pause && exit /b 1)
 copy /Y theme_builder.html "%INSTALL_DIR%\theme_builder.html" >nul
+copy /Y enable-boot-start.ps1 "%INSTALL_DIR%\enable-boot-start.ps1" >nul
+if errorlevel 1 (echo ERROR: could not copy the boot setup script && pause && exit /b 1)
 echo Done.
 echo.
 
-:: Create Desktop and Start Menu shortcuts only if they don't already exist
-:: -- on every rebuild after the first, this step is unnecessary work and
-:: just adds time to the loop.
+:: 5. Desktop and Start Menu shortcuts (only created once)
 echo [5/5] Checking shortcuts...
 set "DESKTOP_LNK=%USERPROFILE%\Desktop\DS916 Tray.lnk"
 if exist "%DESKTOP_LNK%" (
@@ -83,9 +96,13 @@ echo  Installed to: %INSTALL_DIR%
 echo    - DS916Tray.exe
 echo    - theme_builder.html
 echo.
+echo  The app registers itself to start with Windows the first time it runs
+echo  (Settings - "Start display automatically with Windows").
+echo  To also display the saved theme before sign-in, run this once in an
+echo  administrator PowerShell using your normal account:
+echo    powershell -ExecutionPolicy Bypass -File "%INSTALL_DIR%\enable-boot-start.ps1"
+echo.
 
-:: Offer to relaunch immediately -- the whole point of this script handling
-:: close+rebuild+install in one pass is to get back to a running app fast.
 set /p RELAUNCH="Launch DS916 Tray now? (Y/N): "
 if /I "%RELAUNCH%"=="Y" (
   start "" "%INSTALL_DIR%\DS916Tray.exe"

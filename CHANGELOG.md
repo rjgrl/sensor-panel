@@ -4,7 +4,37 @@ All notable changes to this project are documented here. This file was started r
 
 Versions follow [Semantic Versioning](https://semver.org/) loosely: **MAJOR** for breaking changes to the theme file format or protocol, **MINOR** for new features, **PATCH** for fixes.
 
-## [Unreleased]
+## [2.0.1] — No More Sensor Dropouts
+
+### Fixed
+- **Sensors briefly blanking (and the screen freezing) when other programs start.** LibreHardwareMonitor's web server occasionally doesn't answer for a few seconds while it's busy; the app used to drop all sensor values immediately and wait 5 s before asking again, and the request ran inside the frame loop, so the screen could also stall for up to 2 s. LHM is now polled on its own background thread, the last good values stay on screen through hiccups of up to 20 s, and retries happen every second during a hiccup. Short hiccups are logged at Verbose level only; a real outage (LHM closed / web server off) is still logged as a warning.
+- Confirmed nothing from the HWiNFO64 era remains: there is no periodic 30-minute check or restart logic of any kind.
+
+## [2.0.0] — Rust Rewrite & Reliable Start with Windows
+
+### Changed
+- **The tray app is rewritten in Rust** (`src/`, built with `cargo`). Same features, same menu, same settings file, same theme format, same `%APPDATA%\DS916Tray\` layout and the same `DS916Tray.exe` name — existing themes, `config.json` and `lhm_sensors.json` keep working with no changes.
+- **Much lower background memory**: ~14 MB private memory (≈30 MB working set) while streaming, versus a 33 MB PyInstaller exe plus a full Python + Pillow + tkinter runtime before. The tray icon and menu are plain Win32; the GUI toolkit is only loaded by the Settings/Status windows, which now run as their own short-lived process and free all their memory when closed.
+- Less work per frame: theme images are decoded and resized once at load (instead of every frame), the frame buffer and JPEG buffer are reused, and fonts embedded in a theme are read from memory instead of being extracted to temp files.
+- Image layers and background images with transparency are now alpha-blended (they were pasted without their alpha channel before).
+- The tray menu's **Start/Stop Display** label now always reflects the current state.
+- `build.bat` builds with `cargo build --release` instead of PyInstaller. `compile_check.bat` compiles only and writes the output to `build_log.txt`.
+- LibreHardwareMonitor request timeout raised from 1 s to 2 s — LHM occasionally takes longer than a second to answer, which used to cause 5-second sensor dropouts.
+
+### Fixed — app not starting after a shutdown/restart
+- **Root cause: a "Run as administrator" compatibility flag on `DS916Tray.exe`** (`HKCU\...\AppCompatFlags\Layers` = `RUNASADMIN`). Windows silently skips Run-key startup entries that need elevation at sign-in, so the app never auto-started. The app needs no admin rights; it now removes that flag from its own entry on launch (other compatibility flags are kept) and logs it.
+- **The display now waits for the DS916 instead of giving up.** Previously, if the COM port couldn't be opened the moment the app started (normal right after a cold boot, before Windows has enumerated the USB device), the display stayed stopped until it was started by hand. The display thread now retries every 3 seconds until the screen appears, and also reconnects automatically after a write error (screen unplugged, USB reset, wake from sleep). The tray tooltip/Status window show "Waiting for DS916" meanwhile.
+- **Tray icon at sign-in**: adding the icon is retried until the notification area exists, and the icon is re-added when Explorer restarts (`TaskbarCreated`).
+- **Startup entry**: written as `"…\DS916Tray.exe" --autostart` and re-checked on every launch; if Windows has the entry marked *Disabled* (Task Manager → Startup apps) while "Start with Windows" is on, it's re-enabled. The Status window's *Windows Startup* row now reports the real state (entry present, pointing at this exe, and enabled).
+- Working directory is set to the install folder (Windows starts Run-key apps in `System32`).
+- Single instance: a second launch no longer starts a second copy fighting over the COM port; it opens the Status window instead.
+- Sensor discovery now also runs once LibreHardwareMonitor becomes reachable after startup (e.g. when LHM starts after DS916 Tray at sign-in), not only if it was already running.
+- Date formats no longer corrupt month names containing D/M/Y letters (e.g. "December").
+
+### Removed
+- The Python implementation (`ds916_tray.py`, `DS916Tray.spec`) and every remaining piece of HWiNFO64-era code: the `hwinfo_*` config-key cleanup, the old numeric `CUSTOM_<n>` sensor warning, and the HWiNFO references in the Theme Builder and README.
+
+## [1.6.0] — LibreHardwareMonitor
 
 ### Changed — Sensor source switched from HWiNFO64 to LibreHardwareMonitor
 - **All hardware sensors now come from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)** via its built-in Remote Web Server (`http://127.0.0.1:8085/data.json`) instead of HWiNFO64 shared memory. Only one monitoring app is needed; HWiNFO64 can be uninstalled. Pure stdlib (`urllib` + `json`) — no new Python dependencies.

@@ -112,7 +112,20 @@ port.close()
 ```
 sensor-panel/
 ├── theme_builder.html    # Visual theme designer (open in Chrome or Edge)
-├── ds916_tray.py         # Background renderer + system tray app
+├── Cargo.toml            # Rust project for the tray app (DS916Tray.exe)
+├── src/                  # Tray app source (Rust)
+│   ├── main.rs           #   startup, single instance, --settings/--status modes
+│   ├── tray.rs           #   Win32 tray icon + menu (no GUI toolkit in the background)
+│   ├── app.rs            #   display thread: COM port retry, render, stream
+│   ├── render.rs         #   frame renderer (text, bars, rings, graphs, images)
+│   ├── theme.rs          #   .ds916theme / .zip loading
+│   ├── lhm.rs            #   LibreHardwareMonitor reader + sensor discovery
+│   ├── rtss.rs           #   optional RTSS FPS reader
+│   ├── autostart.rs      #   "Start with Windows" registry handling
+│   ├── boot.rs           #   pre-sign-in display and tray handover
+│   └── ui.rs             #   Settings / Status windows
+├── compile_check.bat     # Compile only, output to build_log.txt (dev helper)
+├── enable-boot-start.ps1 # Optional boot task setup / disable / removal
 ├── build.bat             # Build + install script — compiles the exe, closes
 │                         # any running instance, installs it and
 │                         # theme_builder.html to %APPDATA%\DS916Tray\, creates
@@ -129,15 +142,16 @@ After running `build.bat`, this entire folder is no longer needed for normal use
 
 ## Step-by-Step Installation
 
-### Step 1 — Install Python
+### Step 1 — Install Rust
 
-Download and install Python 3.9 or later from https://www.python.org/downloads/
+The tray app is written in Rust (small, fast and light on memory in the background).
 
-> **Important:** During installation, check **"Add Python to PATH"**
+1. Install **Visual Studio Build Tools** with the **"Desktop development with C++"** workload (needed for the MSVC linker): https://visualstudio.microsoft.com/visual-cpp-build-tools/
+2. Install Rust with the default options from https://rustup.rs
 
-Verify it works by opening a Command Prompt and running:
+Verify it works by opening a **new** Command Prompt and running:
 ```
-python --version
+cargo --version
 ```
 
 ### Step 2 — Install LibreHardwareMonitor
@@ -156,8 +170,6 @@ python --version
 4. Leave the web server port at its default **8085** (or set the same port in DS916 Settings → LibreHardwareMonitor tab)
 5. LHM will now start minimized to the system tray on every boot. There's no time limit — it can run indefinitely
 
-> **Switching from HWiNFO64?** You can uninstall HWiNFO64 (or just turn off its Auto Start). Running both at the same time isn't needed, and two monitoring tools polling the same sensor chips can occasionally conflict.
-
 ### Step 3 — Download the Sensor Panel Files
 
 Download or clone this repository:
@@ -174,19 +186,19 @@ build.bat
 ```
 
 This will:
-1. Install all Python dependencies (`pillow`, `pyserial`, `pystray`, `pyinstaller`)
-2. Compile `ds916_tray.py` into a standalone `DS916Tray.exe`
+1. Close any running DS916 Tray
+2. Compile the Rust project into a standalone `DS916Tray.exe` (`cargo build --release`; dependencies are downloaded automatically)
 3. Install `DS916Tray.exe` and `theme_builder.html` together into `%APPDATA%\DS916Tray\` — keeping the app, the theme builder, your config, discovered sensors, and saved themes all in one place for easy cleanup later
 4. Create a **Desktop shortcut** and a **Start Menu shortcut**, both named "DS916 Tray", pointing at the installed copy
 
-> The build takes 1-3 minutes. Once it finishes, the folder you extracted the project into (and its `dist\`/`build\` subfolders) is no longer needed — everything the app uses going forward lives in `%APPDATA%\DS916Tray\`. You can delete the original extracted folder if you'd like.
+> The first build takes a few minutes (later builds take ~30 seconds). Once it finishes, the folder you extracted the project into (and its `target\` subfolder) is no longer needed — everything the app uses going forward lives in `%APPDATA%\DS916Tray\`. You can delete the original extracted folder if you'd like.
 
 ### Step 5 — First Launch
 
 1. Launch **DS916 Tray** from the Desktop shortcut or Start Menu
 2. A small icon appears in your system tray (bottom-right of the taskbar)
 3. The app will:
-   - Add itself to Windows startup automatically
+   - Add itself to Windows startup automatically (see [Start with Windows](#start-with-windows))
    - Connect to LibreHardwareMonitor's web server
    - **Discover all your sensors** and save them to `%APPDATA%\DS916Tray\lhm_sensors.json`
    - Create a `%APPDATA%\DS916Tray\Themes\` folder for storing your theme files
@@ -273,8 +285,37 @@ Open via tray icon → **⚙ Settings…**
 | **FPS** | Frames per second to stream (default: 6, max: 30) |
 | **Theme File** | Path to the last loaded theme (auto-remembered) |
 | **Start with Windows** | Adds/removes the app from Windows startup |
+| **Logging** | Off / Normal / Verbose — see [Logging](#logging) |
 
 > **COM port auto-detection:** the app identifies the DS916 by its USB VID/PID (`33C3:F101`) and automatically updates the COM port setting if it changes between sessions.
+
+### Start with Windows
+
+With this setting on, the app registers itself in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` as `"%APPDATA%\DS916Tray\DS916Tray.exe" --autostart`, and re-checks the entry on every launch so it always points at the installed exe. A few things make the start at sign-in reliable after a shutdown or restart:
+
+- **The DS916 is waited for, not given up on.** Right after a cold boot the screen's USB serial port can take several seconds to appear. The display keeps looking for it every 3 seconds (and also reconnects automatically if the screen is unplugged or the PC wakes from sleep) instead of failing once and staying stopped.
+- **The tray icon survives a slow taskbar.** If Windows hasn't finished creating the notification area when the app starts, adding the icon is retried until it succeeds, and the icon is re-added if Explorer restarts.
+- **Task Manager's "Disabled" flag is cleared.** Windows can keep a startup entry from running if it's been marked *Disabled* under Task Manager → Startup apps. While this setting is on, the app re-enables its entry so the two never disagree. (To stop it starting with Windows, untick the setting here rather than in Task Manager.)
+- **No "Run as administrator".** Windows silently skips startup apps that require elevation at sign-in, so if `DS916Tray.exe` has *Properties → Compatibility → Run this program as an administrator* ticked, it never starts with Windows. The app doesn't need admin rights, so it removes that flag from its own entry on launch (it logs when it does). Don't re-enable it.
+- **Only one copy runs.** Launching it again while it's already running just opens the Status window.
+
+The Status window's **Windows Startup** row shows whether the entry exists, points at this exe, and is enabled.
+
+### Display the saved theme before sign-in
+
+After installing the updated app with `build.bat`, save a theme and keep **Start display automatically with Windows** enabled. In an **administrator PowerShell using your normal Windows account**, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:APPDATA\DS916Tray\enable-boot-start.ps1"
+```
+
+This registers **DS916 Tray Boot**, a Windows startup task running `DS916Tray.exe --boot` with limited privileges under the same account. No password is stored. It loads the same saved config and theme, renders and streams normally, and retries while the USB serial device is still starting. It creates no tray or settings window. After sign-in, the normal tray app asks it to finish its current frame and close the COM port before taking over. A delayed boot task skips the device while the tray app is running.
+
+The boot worker writes `%APPDATA%\DS916Tray\ds916_boot_log.txt` (rotated at 1 MB); the tray keeps its normal log. `build.bat` stops the task's worker before replacing the app and preserves whether the task is enabled. Uninstall removes the task before deleting app data; if permissions prevent removal, uninstall stops without deleting data.
+
+The task starts during **Windows startup**, after BIOS/POST. Keep the theme on a local, unencrypted drive: password-free S4U tasks cannot access network shares or EFS-encrypted files. Live hardware readings require LibreHardwareMonitor to be running; FPS requires RTSS. The theme still renders when those sources are unavailable, using the renderer's existing missing-sensor behavior. This does not configure either sensor provider to start before sign-in.
+
+To return to sign-in-only startup, run the same script with `-Action Disable`. To remove the task completely, use `-Action Remove`. Keep sign-in startup enabled for automatic handover. The task is a boot worker that exits after handover; it is not a persistent service that restarts on sign-out.
 
 ### LibreHardwareMonitor Tab
 
@@ -406,8 +447,6 @@ This file contains every sensor LHM exposes, including hardware-specific sensors
 **Re-run discovery** at any time via tray icon → **🔍 Discover Sensors** — for example after adding new hardware or updating LHM.
 
 > Standard keys (`CPU_USAGE`, `GPU_TEMP`, …) are matched by sensor name and hardware type on every read, and sensors you pick from the list are stored by LHM's stable sensor ID (e.g. `/amdcpu/0/temperature/2`) — so nothing goes stale if the sensor order changes.
->
-> **Themes made with the old HWiNFO sensor list:** standard keys keep working unchanged. Elements bound to a *custom* sensor from the old `hwinfo_sensors.json` (`CUSTOM_<number>`) can't be translated automatically — re-import `lhm_sensors.json` in the Theme Builder, re-pick those sensors and re-save the theme. The tray app logs a warning naming each one.
 
 ### Framerate Sensors
 
@@ -421,8 +460,6 @@ Three additional RTSS sensors are available via the **＋ Sensors** picker but *
 - `RTSS_FPS_AVG` — average framerate across the current RTSS benchmark session
 
 These three are **session-based** — they only populate while an RTSS benchmark/recording session is actively running. They will show 0 at all other times. Start a session in RTSS via its OSD benchmark controls if you want these values.
-
-**`FRAMERATE`** is a legacy key from the HWiNFO version and is no longer populated — LibreHardwareMonitor has no framerate sensor. Use the RTSS keys for FPS.
 
 To set up RTSS:
 1. Install [RivaTuner Statistics Server](https://www.guru3d.com/download/rtss-rivatuner-statistics-server-download/) (also bundled with MSI Afterburner) and make sure it's running
@@ -444,15 +481,17 @@ A few notes worth knowing:
 
 - **`GPU_POWER`** uses LHM's "GPU Package" sensor — total board/ASIC power on NVIDIA and AMD — and only falls back to AMD's GFX core rail ("GPU Core") if nothing else exists, since that rail alone under-reports.
 - **`VRAM_USED`** prefers "D3D Dedicated Memory Used" (what Windows Task Manager shows, and accurate on AMD), falling back to the driver's "GPU Memory Used".
-- **`VRAM_USAGE`** (percentage) is computed from `VRAM_USED` ÷ LHM's "GPU Memory Total" for the same card. If LHM doesn't report a total for your GPU, a small built-in table of known card capacities (`GPU_VRAM_GB` in `ds916_tray.py`) is used as a fallback.
+- **`VRAM_USAGE`** (percentage) is computed from `VRAM_USED` ÷ LHM's "GPU Memory Total" for the same card. If LHM doesn't report a total for your GPU, a small built-in table of known card capacities (`GPU_VRAM_GB` in `src/lhm.rs`) is used as a fallback.
 
-If a standard key doesn't update on your hardware, open LHM and look up the exact sensor name, then add it to that key's candidate list in `STANDARD_SENSOR_RULES` near the top of `ds916_tray.py` (or just pick the sensor directly from the ＋ Sensors list). Open an issue if you find a name that should be added.
+If a standard key doesn't update on your hardware, open LHM and look up the exact sensor name, then add it to that key's candidate list in `STANDARD_SENSOR_RULES` in `src/lhm.rs` (or just pick the sensor directly from the ＋ Sensors list). Open an issue if you find a name that should be added.
 
 ---
 
 ## Sensor Update Speed
 
-LibreHardwareMonitor refreshes its sensors once per second by default (Options → Update Interval). The tray app re-reads LHM at most twice a second, so the panel is never more than one LHM refresh behind. If fast-changing sensors like CPU/GPU usage feel sluggish, lower LHM's update interval — at a small CPU cost to LHM itself.
+LibreHardwareMonitor refreshes its sensors once per second by default (Options → Update Interval). The tray app re-reads LHM at most twice a second, so the panel is never more than one LHM refresh behind. Reading LHM happens on its own background thread, so a slow answer from LHM never holds up the screen.
+
+LHM's web server sometimes stops answering for a few seconds — typically while another program is starting and LHM is busy polling hardware. The panel keeps showing the last values through these hiccups (up to 20 seconds) instead of blanking, and they're only noted in the log at **Verbose** level. Only a longer outage (LHM closed, or its web server switched off) makes the sensor values disappear, and that's logged as a warning. If fast-changing sensors like CPU/GPU usage feel sluggish, lower LHM's update interval — at a small CPU cost to LHM itself.
 
 ---
 
@@ -463,9 +502,9 @@ Right-click tray icon → **ℹ Status…** to see a live dashboard:
 - **Display** — streaming status, COM port, FPS, active theme name and resolution
 - **Sensor Source — LibreHardwareMonitor** — web server address `✅`, LHM version and how many sensors / standard keys were found, or an unavailable warning if LHM isn't running or its web server is off
 - **Live Sensor Snapshot** — current values for CPU/GPU usage and temperature, motherboard temp, CPU fan
-- **System** — Windows startup status
+- **System** — Windows startup status and whether RTSS is connected
 
-The window auto-sizes to its content (capped at 90% of your screen height) and has a **↻ Refresh** button to re-read all values.
+It has a **↻ Refresh** button to re-read all values. The Settings and Status windows run as their own short-lived process, so they use no memory at all once closed.
 
 ---
 
@@ -480,6 +519,8 @@ Configurable in **Settings → General → Logging**:
 - **Off** — nothing is written at all
 - **Normal** (default) — startup, theme loads, connection status, settings changes, and errors — useful detail for troubleshooting without being noisy
 - **Verbose** — adds per-frame and per-sensor-read diagnostics, for actively chasing down a specific problem
+
+Startup lines say whether the app was started by Windows at sign-in (`starting at Windows sign-in`), whether the DS916 was found (`Opened COM4 (DS916 auto-detected…)`) or is still being waited for, and whether the startup entry was (re)registered — the first place to look if the screen ever stays blank after a reboot.
 
 The log file is automatically capped at roughly 1MB (with one rotated backup kept), so it can never grow unbounded no matter how long the app has been running. Use **📁 Open Log Folder** in Settings for quick access, especially useful when reporting an issue.
 

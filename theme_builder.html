@@ -1362,7 +1362,7 @@ function sensorKeyFor(s){
 function applySensorData(data, filename){
   if(!data.sensors||!Array.isArray(data.sensors)) throw new Error('Invalid sensor file');
   if(data.source!=='LibreHardwareMonitor'||!data.sensors.every(s=>typeof s.id==='string'))
-    throw new Error('This looks like an old HWiNFO sensor file — use lhm_sensors.json instead');
+    throw new Error('Not a LibreHardwareMonitor sensor file — use lhm_sensors.json (tray icon → Discover Sensors)');
   discoveredSensors=data.sensors;
 
   // Hardware names as static-label entries in a dedicated 'devicenames' category

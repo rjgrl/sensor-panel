@@ -1,0 +1,58 @@
+[package]
+name = "ds916tray"
+version = "2.0.1"
+edition = "2021"
+description = "Background tray renderer streaming themes to the Jonsbo DS916 screen, reading sensors from LibreHardwareMonitor."
+license = "MIT"
+readme = "README.md"
+
+# Produces DS916Tray.exe (same file name the old Python build used, so the
+# install folder, shortcuts and startup entry keep pointing at the same place).
+[[bin]]
+name = "DS916Tray"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Rendering: anti-aliased 2D shapes, TrueType/OpenType text, image decoding,
+# JPEG encoding (4:4:4, like the old Pillow `subsampling=0`).
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+jpeg-encoder = "0.6"
+base64 = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# DS916 is a USB CDC virtual COM port
+serialport = { version = "4", default-features = false }
+
+# Settings / Status windows (only loaded in the short-lived settings/status
+# process — the background tray process never creates a GUI context).
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+rfd = "0.15"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
